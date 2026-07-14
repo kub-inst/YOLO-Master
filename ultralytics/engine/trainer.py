@@ -14,6 +14,7 @@ import os
 import subprocess
 import time
 import warnings
+from contextlib import nullcontext
 from copy import copy, deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -70,6 +71,41 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
+
+
+def _distributed_env() -> tuple[int, int, int] | None:
+    """Validate torchrun rank variables as an all-or-none contract."""
+    names = ("RANK", "LOCAL_RANK", "WORLD_SIZE")
+    raw = {name: os.getenv(name) for name in names}
+    present = [name for name, value in raw.items() if value not in (None, "")]
+    if not present:
+        return None
+    if len(present) != len(names):
+        raise RuntimeError(f"Incomplete distributed environment: set all of {names}, got {raw}.")
+    try:
+        rank, local_rank, world_size = (int(raw[name]) for name in names)
+    except ValueError as exc:
+        raise RuntimeError(f"Distributed rank variables must be integers, got {raw}.") from exc
+    if world_size < 1 or rank < 0 or rank >= world_size or local_rank < 0:
+        raise RuntimeError(
+            f"Invalid distributed environment: RANK={rank}, LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}."
+        )
+    return rank, local_rank, world_size
+
+
+def _validate_cuda_ddp_device(device: torch.device, env: tuple[int, int, int] | None) -> None:
+    """Fail before collectives when torchrun cannot bind the local CUDA ordinal."""
+    if env is None:
+        return
+    _, local_rank, _ = env
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError(f"torchrun DDP requires available CUDA, but resolved device is {device}.")
+    count = torch.cuda.device_count()
+    if local_rank >= count:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is invalid for {count} visible CUDA device(s). "
+            "Check CUDA_VISIBLE_DEVICES and --nproc_per_node."
+        )
 
 
 def save_trainer_args_yaml(save_dir: Path, args) -> None:
@@ -190,15 +226,8 @@ class BaseTrainer:
         self.args = get_cfg(cfg, overrides)
         self.check_resume(overrides)
         self.device = select_device(self.args.device)
-        # DDP in this trainer is CUDA-only. Never let a stale torchrun
-        # environment route CPU/MPS training into the CUDA DDP path.
-        if self.device.type != "cuda" and any(
-            os.getenv(name) not in (None, "", "-1") for name in ("RANK", "LOCAL_RANK", "WORLD_SIZE")
-        ):
-            raise RuntimeError(
-                f"Distributed environment detected for device={self.device}. "
-                "Run CPU/MPS training without torchrun and unset RANK, LOCAL_RANK, WORLD_SIZE."
-            )
+        self._dist_env = _distributed_env()
+        _validate_cuda_ddp_device(self.device, self._dist_env)
         # Update "-1" devices so post-training val does not repeat search
         self.args.device = os.getenv("CUDA_VISIBLE_DEVICES") if self.device.type == "cuda" else str(self.device)
         self.validator = None
@@ -315,7 +344,12 @@ class BaseTrainer:
                 ddp_cleanup(self, str(file))
 
         else:
-            self._do_train()
+            try:
+                self._do_train()
+            finally:
+                # Resource cleanup only: never add a barrier on an exception path.
+                if dist.is_available() and dist.is_initialized():
+                    dist.destroy_process_group()
 
     def _setup_scheduler(self):
         """Initialize training learning rate scheduler."""
@@ -327,12 +361,21 @@ class BaseTrainer:
 
     def _setup_ddp(self):
         """Initialize and set the DistributedDataParallel parameters for training."""
-        torch.cuda.set_device(RANK)
-        self.device = torch.device("cuda", RANK)
-        os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"  # set to enforce timeout
+        env = _distributed_env()
+        _validate_cuda_ddp_device(torch.device("cuda", LOCAL_RANK), env)
+        if env is None:
+            raise RuntimeError("DDP setup requires torchrun RANK/LOCAL_RANK/WORLD_SIZE variables.")
+        if not dist.is_nccl_available():
+            raise RuntimeError("CUDA DDP requires an NCCL-enabled PyTorch build; refusing an implicit gloo fallback.")
+        torch.cuda.set_device(LOCAL_RANK)
+        self.device = torch.device("cuda", LOCAL_RANK)
+        os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+        timeout_seconds = int(os.getenv("YOLO_DDP_TIMEOUT", "600"))
+        if timeout_seconds <= 0:
+            raise RuntimeError(f"YOLO_DDP_TIMEOUT must be positive, got {timeout_seconds}.")
         dist.init_process_group(
-            backend="nccl" if dist.is_nccl_available() else "gloo",
-            timeout=timedelta(seconds=10800),  # 3 hours
+            backend="nccl",
+            timeout=timedelta(seconds=timeout_seconds),
             rank=RANK,
             world_size=self.world_size,
         )
@@ -352,7 +395,11 @@ class BaseTrainer:
         if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size
             self.args.batch = self.batch_size = self.auto_batch()
 
-        # Dataloaders
+        # Dataloaders. DDP treats the configured batch as global.
+        if self.world_size > 1 and self.batch_size % self.world_size:
+            raise ValueError(
+                f"Global batch size {self.batch_size} must be divisible by DDP world size {self.world_size}."
+            )
         batch_size = self.batch_size // max(self.world_size, 1)
         self.train_loader = self.get_dataloader(
             self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
@@ -643,14 +690,24 @@ class BaseTrainer:
             self.amp = torch.tensor(check_amp(self.model), device=self.device)
             callbacks.default_callbacks = callbacks_backup  # restore callbacks
         if RANK > -1 and self.world_size > 1:  # DDP
-            dist.broadcast(self.amp.int(), src=0)  # broadcast from rank 0 to all other ranks; gloo errors with boolean
-        self.amp = bool(self.amp)  # as boolean
+            amp_flag = self.amp.to(dtype=torch.int32)
+            dist.broadcast(amp_flag, src=0)
+            self.amp = bool(amp_flag.item())
+        else:
+            self.amp = bool(self.amp)
         self.scaler = (
             torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
         )
         if self.world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(
-                self.model, device_ids=[RANK] if self.device.type == "cuda" else None, find_unused_parameters=True
+                self.model,
+                device_ids=[LOCAL_RANK] if self.device.type == "cuda" else None,
+                output_device=LOCAL_RANK if self.device.type == "cuda" else None,
+                find_unused_parameters=True,
+                # Lazy MoE diagnostics can be CPU tensors; NCCL cannot broadcast them.
+                # BatchNorm running stats are rank-local; use SyncBatchNorm for global stats.
+                broadcast_buffers=False,
+                static_graph=False,
             )
 
         self.ema = ModelEMA(self.model)
@@ -908,6 +965,9 @@ class BaseTrainer:
                         if "momentum" in x:
                             x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
 
+                should_step = ni - last_opt_step >= self.accumulate or i == nb - 1
+                sync_context = self.model.no_sync() if RANK != -1 and not should_step else nullcontext()
+                sync_context.__enter__()
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
@@ -1009,8 +1069,11 @@ class BaseTrainer:
                         self.loss *= self.world_size
                     self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
 
-                # Backward
-                self.scaler.scale(self.loss).backward()
+                # Backward. Always unwind no_sync if forward/backward raises.
+                try:
+                    self.scaler.scale(self.loss).backward()
+                finally:
+                    sync_context.__exit__(None, None, None)
 
                 # LoRA collapse early detection:
                 # warn when loss stays zero/NaN for many consecutive iterations
@@ -1037,7 +1100,7 @@ class BaseTrainer:
                         if isinstance(module, FewShotLoRAConv) and module.gradient_importance_weighted:
                             module._update_importance()
                 
-                if ni - last_opt_step >= self.accumulate:
+                if should_step:
                     self.optimizer_step()
                     last_opt_step = ni
 
@@ -1760,17 +1823,30 @@ class BaseTrainer:
             for hook in hooks:
                 hook.remove()
 
-    def validate(self):
-        """Run validation on val set using self.validator.
-
-        Returns:
-            metrics (dict): Dictionary of validation metrics.
-            fitness (float): Fitness score for the validation.
-        """
-        if self.ema and self.world_size > 1:
-            # Sync EMA buffers from rank 0 to all ranks
-            for buffer in self.ema.ema.buffers():
+    def _sync_ema_buffers_for_validation(self):
+        """Sync validation state without sending CPU diagnostics to NCCL."""
+        if not self.ema or self.world_size <= 1 or not dist.is_initialized():
+            return
+        backend, skipped = dist.get_backend(), []
+        for module_name, module in self.ema.ema.named_modules():
+            for name, buffer in module.named_buffers(recurse=False):
+                full_name = f"{module_name}.{name}" if module_name else name
+                persistent = name not in module._non_persistent_buffers_set
+                if backend == "nccl" and buffer.device.type != "cuda":
+                    if persistent:
+                        raise RuntimeError(
+                            f"Persistent EMA buffer '{full_name}' is on {buffer.device}; NCCL validation requires CUDA."
+                        )
+                    skipped.append(full_name)
+                    continue
                 dist.broadcast(buffer, src=0)
+        if skipped and not getattr(self, "_warned_ema_cpu_diagnostics", False):
+            LOGGER.warning(f"Skipping {len(skipped)} non-persistent CPU EMA diagnostic buffer(s) for NCCL validation.")
+            self._warned_ema_cpu_diagnostics = True
+
+    def validate(self):
+        """Run validation on val set using self.validator."""
+        self._sync_ema_buffers_for_validation()
         metrics = self.validator(self)
         if metrics is None:
             return None, None
@@ -1950,20 +2026,23 @@ class BaseTrainer:
 
     def _handle_nan_recovery(self, epoch):
         """Detect and recover from NaN/Inf loss and fitness collapse by loading last checkpoint."""
-        loss_nan = self.loss is not None and not self.loss.isfinite()
+        loss_nan = self.loss is not None and not bool(torch.isfinite(self.loss.detach()).all().item())
         fitness_nan = self.fitness is not None and not np.isfinite(self.fitness)
-        fitness_collapse = self.best_fitness and self.best_fitness > 0 and self.fitness == 0
-        corrupted = RANK in {-1, 0} and (loss_nan or fitness_nan or fitness_collapse)
+        fitness_collapse = bool(self.best_fitness and self.best_fitness > 0 and self.fitness == 0)
+        local_corrupted = bool(loss_nan or fitness_nan or fitness_collapse)
         reason = "Loss NaN/Inf" if loss_nan else "Fitness NaN/Inf" if fitness_nan else "Fitness collapse"
-        if RANK != -1:  # DDP: broadcast to all ranks
-            broadcast_list = [corrupted if RANK == 0 else None]
-            dist.broadcast_object_list(broadcast_list, 0)
-            corrupted = broadcast_list[0]
+        if RANK != -1:
+            # NCCL requires CUDA collective tensors; gloo accepts CPU.
+            flag_device = self.device if dist.get_backend() == "nccl" else torch.device("cpu")
+            corrupted_flag = torch.tensor(int(local_corrupted), dtype=torch.int32, device=flag_device)
+            dist.all_reduce(corrupted_flag, op=dist.ReduceOp.MAX)
+            corrupted = bool(corrupted_flag.item())
+        else:
+            corrupted = local_corrupted
         if not corrupted:
             return False
         if epoch == self.start_epoch or not self.last.exists():
-            LOGGER.warning(f"{reason} detected but can not recover from last.pt...")
-            return False  # Cannot recover on first epoch, let training continue
+            raise RuntimeError(f"Global nonfinite training state detected ({reason}) without a healthy recovery checkpoint.")
         self.nan_recovery_attempts += 1
         if self.nan_recovery_attempts > 3:
             raise RuntimeError(f"Training failed: NaN persisted for {self.nan_recovery_attempts} epochs")
