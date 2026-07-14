@@ -3,7 +3,7 @@ import torch
 from ultralytics.nn.modules.moa import C2fMoA
 from ultralytics.nn.modules.moe.modules import UltraOptimizedMoE
 from ultralytics.nn.modules.mot import C2fMoT
-from ultralytics.utils.loss import _collect_mixture_aux_loss
+from ultralytics.utils.loss import _collect_mixture_aux_loss, _get_mixture_loss_ema
 
 
 def test_mixture_aux_loss_uses_ema_scales():
@@ -29,6 +29,28 @@ def test_mixture_aux_loss_uses_ema_scales():
     # EMA scales should stay positive and stable across steps
     ema_buf = model._mixture_loss_ema_buf
     assert all(float(ema_buf[i]) >= 1e-4 for i in range(ema_buf.numel()))
+
+
+def test_mixture_loss_ema_initializes_for_parameterized_model_without_tensor_bool():
+    model = torch.nn.Linear(2, 2).train()
+
+    ema = _get_mixture_loss_ema(model)
+
+    assert ema["moe"] == 1.0
+    assert abs(ema["mot"] - 0.1) < 1e-6
+    assert abs(ema["moa"] - 0.1) < 1e-6
+    assert model._mixture_loss_ema_buf.device == model.weight.device
+
+
+def test_mixture_loss_ema_initializes_for_parameter_free_model():
+    model = torch.nn.ReLU().train()
+
+    ema = _get_mixture_loss_ema(model)
+
+    assert ema["moe"] == 1.0
+    assert abs(ema["mot"] - 0.1) < 1e-6
+    assert abs(ema["moa"] - 0.1) < 1e-6
+    assert model._mixture_loss_ema_buf.device.type == "cpu"
 
 
 def test_moa_linear_attn_fp16_stable():

@@ -86,7 +86,10 @@ def _get_mixture_loss_ema(model: nn.Module | None) -> dict[str, float] | None:
     if buf is None:
         import torch as _torch
         defaults = [_MIXTURE_LOSS_EMA_DEFAULTS[k] for k in _MIXTURE_LOSS_EMA_KEYS]
-        _device = next(model.parameters()).device if any(True for _ in model.parameters()) else _torch.device("cpu")
+        # ``next(..., None)`` is safe for parameter-free modules and never
+        # coerces a Parameter tensor to bool (which raises in PyTorch).
+        parameter = next(model.parameters(), None)
+        _device = parameter.device if parameter is not None else _torch.device("cpu")
         model.register_buffer(
             "_mixture_loss_ema_buf",
             _torch.tensor(defaults, dtype=_torch.float32, device=_device),
