@@ -135,8 +135,9 @@ class TestStateDictPersistence:
         layer = MoLoRALayer(nn.Conv2d(4, 4, 1), **kwargs)
         layer.train()
         x = torch.randn(1, 4, 2, 2)
-        for _ in range(4):
-            layer(x)
+        with torch.no_grad():
+            for _ in range(4):
+                layer(x)
 
         saved_step = layer._step_count.item()
         saved_top_k = layer._current_top_k()
