@@ -1847,11 +1847,17 @@ class BaseTrainer:
                 persistent = name not in module._non_persistent_buffers_set
                 if backend == "nccl" and buffer.device.type != "cuda":
                     if persistent:
-                        raise RuntimeError(
-                            f"Persistent EMA buffer '{full_name}' is on {buffer.device}; NCCL validation requires CUDA."
-                        )
-                    skipped.append(full_name)
-                    continue
+                        # Move diagnostic buffers (e.g. _mixture_loss_ema_buf) to the
+                        # EMA model's device so NCCL broadcast can proceed.  These are
+                        # small float tensors lazily registered before model.to(device).
+                        try:
+                            buffer.data = buffer.to(self.device)
+                        except RuntimeError:
+                            skipped.append(full_name)
+                            continue
+                    else:
+                        skipped.append(full_name)
+                        continue
                 dist.broadcast(buffer, src=0)
         if skipped and not getattr(self, "_warned_ema_cpu_diagnostics", False):
             LOGGER.warning(f"Skipping {len(skipped)} non-persistent CPU EMA diagnostic buffer(s) for NCCL validation.")
