@@ -53,7 +53,7 @@ from ultralytics.utils.lora import (
     save_lora_adapters,
 )
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
-from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
+from ultralytics.utils.dist import collect_ddp_error_logs, ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
 from ultralytics.utils.plotting import plot_results
 from ultralytics.utils.torch_utils import (
@@ -340,10 +340,12 @@ class BaseTrainer:
                 # Inherit stdout/stderr so torchrun's Root Cause and worker traceback remain visible.
                 subprocess.run(cmd, check=True)
             except subprocess.CalledProcessError as e:
+                worker_errors = collect_ddp_error_logs(getattr(self, "ddp_log_dir", ""))
+                if worker_errors:
+                    LOGGER.error(f"DDP persisted worker root cause:\n{worker_errors}")
                 LOGGER.error(
                     f"DDP worker process failed with exit code {e.returncode}. "
-                    "The real worker traceback is printed above under 'Root Cause'/'error_file'; "
-                    "do not diagnose from CalledProcessError alone."
+                    "The worker Root Cause is printed above and persisted under the DDP log directory."
                 )
                 raise
             finally:

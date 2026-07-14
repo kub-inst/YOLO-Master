@@ -80,6 +80,26 @@ if __name__ == "__main__":
     return file.name
 
 
+def collect_ddp_error_logs(log_dir, max_chars: int = 50000) -> str:
+    """Collect Elastic error metadata and worker stderr after a failed launch."""
+    log_dir = os.fspath(log_dir)
+    if not os.path.isdir(log_dir):
+        return ""
+    chunks = []
+    for root, _, files in os.walk(log_dir):
+        for name in sorted(files):
+            if name not in {"error.json", "stderr.log"}:
+                continue
+            path = os.path.join(root, name)
+            try:
+                text = open(path, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            if text:
+                chunks.append(f"--- {path} ---\n{text[-max_chars:]}")
+    return "\n".join(chunks)
+
+
 def generate_ddp_command(trainer):
     """Generate command for distributed training.
 
@@ -97,6 +117,8 @@ def generate_ddp_command(trainer):
     file = generate_ddp_file(trainer)
     dist_cmd = "torch.distributed.run" if TORCH_1_9 else "torch.distributed.launch"
     port = find_free_network_port()
+    log_dir = USER_CONFIG_DIR / "DDP" / f"logs_{id(trainer)}"
+    log_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
         "-m",
@@ -105,8 +127,12 @@ def generate_ddp_command(trainer):
         f"{trainer.world_size}",
         "--master_port",
         f"{port}",
-        file,
     ]
+    if TORCH_1_9:
+        # Supported by the current torchrun: persist every rank's streams while teeing them to the parent log.
+        cmd.extend(["--log-dir", str(log_dir), "--tee", "3"])
+    cmd.append(file)
+    trainer.ddp_log_dir = log_dir
     return cmd, file
 
 
