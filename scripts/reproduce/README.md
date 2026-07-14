@@ -216,4 +216,31 @@ runs/reproduce/<dataset>/summary.csv
 
 aggregates the final metrics for both models, including a `dense_eval` column that records whether `--no-sparse-eval` was applied.
 
+## 6. AI-TOD-v2 — a tiny-object stress test
+
+[AI-TOD-v2](https://github.com/Chasel-Tsui/AI-TOD-v2) is a much harder aerial **tiny-object** benchmark: 8 classes, ~800px crops, **mean object size ≈ 12px**, and a heavy class imbalance (one class dominates ~88% of the boxes). It pushes the two nano variants well past VisDrone/SKU-110K, and cleanly exposes a difference between their two MoE designs.
+
+The same driver reproduces it (built-in config `AI-TOD-v2.yaml`). AI-TOD is natively **800px** — train at `--imgsz 800` so the ~12px objects survive:
+
+```bash
+# ------ AI-TOD-v2 ------
+# YOLO-Master-v0.1-N
+python scripts/reproduce/reproduce_aitodv2.py --model v0.1-N  --imgsz 800 --batch 64 --epochs 300
+# YOLO-Master-EsMoE-N (dense eval)
+python scripts/reproduce/reproduce_aitodv2.py --model EsMoE-N --imgsz 800 --batch 64 --epochs 300 --no-sparse-eval
+```
+
+Weights:
+
+| Dataset | Model | mAP50 | mAP50-95 | Weights |
+| --- | --- | --- | --- | --- |
+| AI-TOD-v2 | `YOLO-Master-v0.1-N` | 0.2822 | 0.1204 | [Download](https://github.com/skywalker-lt/YOLO-Master/releases/download/v0.1.0/yolo-master-v01-n-aitodv2.pt) |
+| AI-TOD-v2 | `YOLO-Master-EsMoE-N` | ≈0 (collapsed) | ≈0 | [Download](https://github.com/skywalker-lt/YOLO-Master/releases/download/v0.1.0/yolo-master-esmoe-n-aitodv2.pt) |
+
+### Finding: `ES_MOE` routing collapses on AI-TOD-v2
+
+**Mechanism.** On AI-TOD-v2's homogeneous tiny objects, `EsMoE-N`'s pure top-k router collapses onto a single expert — one early MoE layer reaches `>0.8` max-usage — and validation mAP freezes at the noise floor (≈1e-5), even with the built-in routing-collapse recovery. `v0.1-N`'s `ModularRouterExpertMoE` keeps an always-on **shared expert** (a guaranteed signal path independent of the router), so on the *identical* data it trains cleanly to 0.28 mAP50.
+
+**Takeaway.** On tiny-object / low-diversity data, prefer the shared-expert `v0.1-N`; `ES_MOE` needs a larger, more diverse token distribution to keep its experts balanced. The AI-TOD-v2 `EsMoE-N` weights above are included for completeness — they are a collapsed model.
+
 **Should you have any questions or doubts, feel free to make a comment or contact: rlici@connect.ust.hk**
