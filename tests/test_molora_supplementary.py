@@ -130,6 +130,30 @@ class TestStateDictPersistence:
         assert torch.allclose(out1_eval, out2, atol=1e-5), \
             "Outputs differ after state_dict round-trip"
 
+    def test_warmup_state_restored(self):
+        kwargs = dict(r=2, alpha=4, num_experts=3, top_k=3, top_k_warmup=1, warmup_steps=6)
+        layer = MoLoRALayer(nn.Conv2d(4, 4, 1), **kwargs)
+        layer.train()
+        x = torch.randn(1, 4, 2, 2)
+        with torch.no_grad():
+            for _ in range(4):
+                layer(x)
+
+        saved_step = layer._step_count.item()
+        saved_top_k = layer._current_top_k()
+        assert (saved_step, saved_top_k) == (4, 2)
+
+        restored = MoLoRALayer(nn.Conv2d(4, 4, 1), **kwargs)
+        restored.train()
+        assert (restored._step_count.item(), restored._current_top_k()) == (0, 1)
+
+        incompatible = restored.load_state_dict(layer.state_dict())
+
+        assert incompatible.missing_keys == []
+        assert incompatible.unexpected_keys == []
+        assert restored._step_count.item() == saved_step
+        assert restored._current_top_k() == saved_top_k
+
     def test_step_count_persisted(self):
         """_step_count buffer should be in state_dict (persistent=True)."""
         layer = _conv_layer()
