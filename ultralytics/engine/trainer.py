@@ -2274,7 +2274,14 @@ class BaseTrainer:
                     ema_target, ema_state, context="resume checkpoint EMA model", adapter_only=True
                 )
             else:
-                self.ema.ema.load_state_dict(ema_state)
+                # Checkpoints created before lazy persistent buffers existed remain
+                # valid: retain the freshly initialized defaults for missing buffers.
+                missing, unexpected = self.ema.ema.load_state_dict(ema_state, strict=False)
+                if missing or unexpected:
+                    LOGGER.warning(
+                        "[checkpoint restore] EMA state_dict compatibility: "
+                        f"missing={missing}, unexpected={unexpected}"
+                    )
             self.ema.updates = ckpt["updates"]
         self.best_fitness = ckpt.get("best_fitness", 0.0)
 
