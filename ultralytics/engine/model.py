@@ -852,14 +852,15 @@ class Model(torch.nn.Module):
         # initialized model freezes the backbone and leaves only tiny adapters trainable,
         # which produces near-zero mAP and often causes NaN gradients in FP16.
         if not self.ckpt and self.cfg and not kwargs.get("pretrained") and "lora_r" not in kwargs:
-            if args.get("lora_r", 0) > 0:
-                LOGGER.warning(
-                    "[LoRA] Model loaded from YAML without pretrained weights. "
-                    "Auto-disabling LoRA (lora_r=0) because LoRA is designed for "
-                    "fine-tuning pretrained backbones, not training from scratch. "
-                    "Pass lora_r=N explicitly to force LoRA on a randomly initialized model."
-                )
-                args["lora_r"] = 0
+            # args may not yet contain lora_r, but DEFAULT_CFG_DICT defaults to 16.
+            # Force-disable regardless so BaseTrainer does not inherit the default.
+            LOGGER.warning(
+                "[LoRA] Model loaded from YAML without pretrained weights. "
+                "Auto-disabling LoRA (lora_r=0) because LoRA is designed for "
+                "fine-tuning pretrained backbones, not training from scratch. "
+                "Pass lora_r=N explicitly to force LoRA on a randomly initialized model."
+            )
+            args["lora_r"] = 0
 
         self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
         if not args.get("resume"):  # manually set model only if not resuming
