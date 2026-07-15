@@ -142,7 +142,7 @@ cfg: # (str, optional) path to a config.yaml that overrides defaults
 tracker: botsort.yaml # (str) tracker config file: botsort.yaml or bytetrack.yaml
 
 # LoRA settings ---------------------------------------------------------------------------------------------------------
-lora_r: 16 # (int) LoRA rank (0 to disable). PAPER DEFAULT: r=16 enables LoRA by default for all MoLoRA / LoRA experiments. Set to 0 for backward-compatible (no-LoRA) baseline.
+lora_r: 0 # (int) LoRA rank (0 to disable). Default is 0 (disabled) for backward compatibility; set to a positive value (e.g. 16) to enable LoRA fine-tuning.
 lora_alpha: 32 # (int) LoRA alpha (recommended: 2 * r)
 lora_dropout: 0.05 # (float) LoRA dropout
 lora_bias: "none" # (str) LoRA bias type: "none", "all", "lora_only"
@@ -171,7 +171,7 @@ lora_from_layer: # (int, optional) Start applying from layer index
 lora_to_layer: # (int, optional) Stop applying at layer index
 lora_allow_depthwise: False # (bool) Allow depthwise convolution
 lora_kernels: # (list[int], optional) Filter by kernel size
-lora_skip_stem: False # (bool) Skip the first three top-level backbone layers (stem); recommended for transfer learning
+lora_skip_stem: True  # Default True: skip un-normalized stem layers (prevents FP16 NaN on first conv)
 lora_min_channels: 0 # (int) Skip layers whose min(in_channels, out_channels) < this value (0 disables; try 32 to keep LoRA genuinely low-rank)
 lora_gradient_checkpointing: True # (bool) Enable gradient checkpointing for LoRA memory optimization
 lora_lr_mult: 2.0 # (float) Learning rate multiplier for LoRA params vs base (2.0 recommended)
