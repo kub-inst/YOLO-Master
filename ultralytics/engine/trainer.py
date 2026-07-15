@@ -406,10 +406,17 @@ class BaseTrainer:
             roots.append(self.model.model)
             if hasattr(self.model.model, "model"):
                 roots.append(self.model.model.model)
+        dense_moe_modules = 0
         for root in roots:
             if getattr(root, "use_gradient_checkpointing", False):
                 root.use_gradient_checkpointing = False
                 disabled = True
+            for module in root.modules():
+                # Sparse expert dispatch changes the parameter-use set per batch.
+                # Force dense dispatch so DDP does not fire ready hooks twice.
+                if hasattr(module, "expert_projections") and hasattr(module, "ddp_safe_dense"):
+                    module.ddp_safe_dense = True
+                    dense_moe_modules += 1
         # Freeze leftover LoRA adapters on MoE control paths from older configs
         # that incorrectly targeted complexity_estimator / se_gate.
         frozen = 0
@@ -421,12 +428,11 @@ class BaseTrainer:
                 if param.requires_grad:
                     param.requires_grad_(False)
                     frozen += 1
-        if disabled or frozen:
+        if disabled or frozen or dense_moe_modules:
             LOGGER.warning(
-                "[LoRA+MoE+DDP] Disabled gradient checkpointing"
-                + (f" and froze {frozen} control-path LoRA params" if frozen else "")
-                + " to avoid DDP 'marked as ready twice' "
-                "(find_unused_parameters=True is incompatible with GC on unused adapters)."
+                "[MoE+DDP] Enabled dense expert dispatch and disabled gradient checkpointing"
+                + (f"; froze {frozen} control-path LoRA params" if frozen else "")
+                + " to keep the DDP parameter-use graph stable."
             )
 
     def _setup_train(self):
@@ -753,12 +759,16 @@ class BaseTrainer:
                     "DDP uses broadcast_buffers=False: BatchNorm running statistics are rank-local. "
                     "EMA/rank0 validation follows rank0 statistics; use an explicitly tested SyncBatchNorm setup if global BN is required."
                 )
-            # PyTorch DDP does not support gradient checkpointing together with
-            # find_unused_parameters=True when unused LoRA/MoE params exist
-            # ("marked as ready twice"). MoE sparse dispatch requires unused
-            # detection, so disable GC for LoRA+MoE multi-GPU runs.
-            if is_lora and getattr(self, "_has_moe", False):
+            # Sparse MoE dispatch and gradient checkpointing can both trigger
+            # duplicate DDP ready hooks. Disable checkpointing for every MoE DDP
+            # run, not only LoRA runs.
+            has_moe = getattr(self, "_has_moe", False)
+            if has_moe:
                 self._disable_gradient_checkpointing_for_ddp_moe_lora()
+
+            # MoE expert modules are selected dynamically, so unused-parameter
+            # detection is required. Keep it enabled, but avoid reentrant
+            # checkpointed backward graphs that make DDP mark a parameter twice.
             self.model = nn.parallel.DistributedDataParallel(
                 self.model,
                 device_ids=[LOCAL_RANK] if self.device.type == "cuda" else None,

@@ -293,6 +293,7 @@ class DiversifiedExpertGroup(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.weight_threshold = weight_threshold
+        self.ddp_safe_dense = False
 
         hidden_dim = max(1, int(in_channels * expand_ratio))
 
@@ -349,7 +350,9 @@ class DiversifiedExpertGroup(nn.Module):
 
         output = x.new_zeros(B, self.out_channels, H, W)
 
-        if torch.onnx.is_in_onnx_export():
+        if getattr(self, "ddp_safe_dense", False) or torch.onnx.is_in_onnx_export():
+            # DDP requires a stable parameter-use graph across iterations.
+            # Evaluate every expert, then select the routed top-k outputs.
             all_projs = torch.stack(
                 [self.expert_projections[i](self.dw_layers[i](features))
                  for i in range(self.num_experts)], dim=1

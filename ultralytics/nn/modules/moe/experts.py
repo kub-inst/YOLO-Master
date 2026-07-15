@@ -201,6 +201,7 @@ class SharedInvertedExpertGroup(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.weight_threshold = weight_threshold
+        self.ddp_safe_dense = False
         hidden_dim = max(1, int(in_channels * expand_ratio))
         padding = kernel_size // 2
 
@@ -237,10 +238,10 @@ class SharedInvertedExpertGroup(nn.Module):
 
         output = x.new_zeros(B, self.out_channels, H, W)
 
-        if torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
-            # Export tracing cannot capture data-dependent ``torch.unique`` /
-            # dynamic-length loops used by the sparse path. Dense path:
-            # compute every expert projection, gather Top-K, weighted-sum.
+        if getattr(self, "ddp_safe_dense", False) or torch.onnx.is_in_onnx_export() or torch.jit.is_tracing():
+            # DDP needs a stable parameter-use graph; export/tracing also cannot
+            # capture the data-dependent sparse dispatch below. Compute every
+            # expert projection, then gather Top-K and weighted-sum.
             all_projs = torch.stack(
                 [proj(features) for proj in self.expert_projections], dim=1
             )  # [B, E, out_C, H, W]

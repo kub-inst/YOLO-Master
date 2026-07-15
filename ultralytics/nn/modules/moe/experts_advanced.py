@@ -62,6 +62,7 @@ class FusedExpertGroup(nn.Module):
         self.norm_eps = 1e-5
         self.expert_norm_weight = nn.Parameter(torch.ones(num_experts, out_channels))
         self.expert_norm_bias = nn.Parameter(torch.zeros(num_experts, out_channels))
+        self.ddp_safe_dense = False
 
         self.activation = nn.SiLU(inplace=True)
 
