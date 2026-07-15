@@ -777,7 +777,7 @@ class BaseTrainer:
                 # Lazy MoE diagnostics can be CPU tensors; NCCL cannot broadcast them.
                 # BatchNorm running stats are rank-local; use SyncBatchNorm for global stats.
                 broadcast_buffers=False,
-                static_graph=False,
+                static_graph=True,
             )
 
         self.ema = ModelEMA(self.model)
