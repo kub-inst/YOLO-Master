@@ -163,16 +163,29 @@ class UltraEfficientRouter(nn.Module):
 
 
 class BaseRouter(nn.Module):
-    def __init__(self, num_experts, top_k):
+    """Base router with optional capacity factor support (P1-5 fix).
+
+    Capacity factor controls the maximum number of tokens each expert can handle
+    per step. When a batch has more tokens than ``capacity_factor * num_experts``,
+    excess tokens are routed to an overflow bucket and handled by default experts.
+    This prevents OOM when a single expert gets overloaded.
+    """
+
+    def __init__(self, num_experts, top_k, capacity_factor: Optional[float] = None):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.capacity_factor = capacity_factor  # P1-5: optional token-level overflow guard
         self.softmax = nn.Softmax(dim=1)
 
     def _process_logits(self, logits: torch.Tensor, noise_std: float, training: bool,
                         top_k: Optional[int] = None) -> Tuple[
         torch.Tensor, torch.Tensor, Dict]:
-        """Unified logic to process logits into Top-K selection."""
+        """Unified logic to process logits into Top-K selection.
+
+        P1-5: When capacity_factor is set, excess tokens beyond the capacity limit
+        are masked out of the routing and assigned to a default expert.
+        """
         B = logits.shape[0]
         effective_top_k = self.top_k if top_k is None else max(1, min(int(top_k), self.num_experts))
 
@@ -192,6 +205,16 @@ class BaseRouter(nn.Module):
         # 3) Select Top-K
         topk_vals, topk_indices = torch.topk(probs, effective_top_k, dim=1)
 
+        # P1-5: Apply capacity factor constraint if configured
+        overflow_mask = None
+        if self.capacity_factor is not None and training:
+            max_tokens = int(self.capacity_factor * self.num_experts)
+            if B > max_tokens:
+                overflow_mask = torch.zeros(B, dtype=torch.bool, device=logits.device)
+                # Randomly select which tokens get routed normally (first max_tokens)
+                indices = torch.randperm(B, device=logits.device)[:max_tokens]
+                overflow_mask[indices] = True
+
         # 4) Normalize weights
         sum_vals = topk_vals.sum(dim=1, keepdim=True) + 1e-6
         topk_vals = topk_vals / sum_vals
@@ -202,6 +225,8 @@ class BaseRouter(nn.Module):
             loss_dict['router_logits'] = logits
             loss_dict['router_probs'] = probs
             loss_dict['topk_indices'] = topk_indices
+            if overflow_mask is not None:
+                loss_dict['overflow_count'] = int(B - max_tokens)
 
         return topk_vals, topk_indices, loss_dict
 

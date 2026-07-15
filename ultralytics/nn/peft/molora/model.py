@@ -32,10 +32,35 @@ def get_peft_molora_model(
         The model with selected layers replaced by MoLoRALayer wrappers.
         Note: this modifies the model **in-place**.
     """
-    # Prevent double-wrapping
+    # Prevent double-wrapping (P1-8 fix: comprehensive check for peft layers)
     if getattr(model, "molora_enabled", False):
         LOGGER.warning("[MoLoRA] Model already has MoLoRA enabled. Skipping re-application.")
         return model
+
+    # Check if any target module is already a PeftAdapter (prevents parameter name conflicts)
+    try:
+        from peft.tuners.adapter_prefix_tuning import PrefixEncoder
+        _peft_classes = tuple([PrefixEncoder])
+        # Common peft adapter classes to detect
+        for cls_name in ("LoraLayer", "AdaLoRALayer", "IA3Layer", "AdaloraLayer"):
+            try:
+                mod, attr = __import__("peft.tuners", fromlist=[cls_name]), None
+                for part in cls_name.split("."):
+                    mod = getattr(mod, part)
+                _peft_classes = _peft_classes + (mod,)
+            except AttributeError:
+                pass
+    except ImportError:
+        _peft_classes = ()
+
+    modules_dict = dict(model.named_modules())
+    for name, module in modules_dict.items():
+        if _peft_classes and isinstance(module, _peft_classes):
+            LOGGER.warning(
+                f"[MoLoRA] Layer '{name}' is already a PEFT adapter. Skipping full model wrap "
+                f"to prevent parameter name conflicts. Use only_molora=True to add MoLoRA alongside."
+            )
+            return model
 
     if isinstance(config, MoLoRAConfig):
         cfg = config

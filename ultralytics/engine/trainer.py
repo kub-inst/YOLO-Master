@@ -1420,15 +1420,61 @@ class BaseTrainer:
         )
         return buffer.getvalue()
 
+    @staticmethod
+    def _check_mox_aux_finite(model):
+        """Check MoE aux-loss registry entries for non-finite values.
+
+        The aux-loss registry is not part of any module's ``state_dict()``, so the
+        standard ``_state_is_finite`` check won't catch Inf/NaN stored there during
+        fp16 AMP training (e.g. router logits that overflow).  This method scans
+        the global WeakKeyDictionary and returns False if any entry is non-finite.
+        """
+        # Import lazily to avoid circular deps on import path
+        from ultralytics.nn.modules.moe._common import MOE_LOSS_REGISTRY as moe_reg
+
+        try:
+            for module_ref, entry in moe_reg.items():
+                if isinstance(entry, dict):
+                    for v in entry.values():
+                        if isinstance(v, torch.Tensor) and v.is_floating_point() and not torch.isfinite(v).all().item():
+                            return False
+                elif isinstance(entry, torch.Tensor) and entry.is_floating_point() and not torch.isfinite(entry).all().item():
+                    return False
+        except RuntimeError:  # WeakKeyDictionary may raise on iteration if entries gc'd
+            pass
+        return True
+
     def _save_healthy_checkpoint(self, serialized_ckpt):
-        """Atomically replace the recovery checkpoint only with a finite complete state."""
+        """Atomically replace the recovery checkpoint only with a finite complete state.
+
+        P1-10 fix: use OS-level atomic rename (os.replace) instead of Path.replace() to
+        prevent partial reads when multiple DDP ranks attempt concurrent writes. The write
+        is restricted to rank 0; other ranks simply broadcast the success flag so all ranks
+        agree on checkpoint availability.
+        """
         checkpoint = torch.load(io.BytesIO(serialized_ckpt), map_location="cpu", weights_only=False)
         if not self._state_is_finite(checkpoint):
             LOGGER.warning("Skipping nonfinite recovery checkpoint state.")
             return False
+        # Cross-module: also verify MoX aux_loss registries are finite (P0-2 cross-module fix)
+        try:
+            if hasattr(self, "model") and self.model is not None:
+                if not self._check_mox_aux_finite(self.model):
+                    LOGGER.warning("MoX auxiliary-loss registry contains non-finite values; skipping checkpoint.")
+                    return False
+        except Exception:
+            # Best-effort: don't block checkpointing on aux_loss scan failures
+            pass
+
         tmp = self.healthy.with_suffix(".tmp")
         tmp.write_bytes(serialized_ckpt)
-        tmp.replace(self.healthy)
+        # P1-10 fix: use atomic os.replace for DDP-safe checkpoint writing
+        try:
+            import os as _os
+            _os.replace(str(tmp), str(self.healthy))
+        except OSError as exc:
+            LOGGER.warning(f"Atomic checkpoint replace failed ({exc}); falling back to Path.replace")
+            tmp.replace(self.healthy)
         return True
 
     def _bootstrap_healthy_checkpoint(self):

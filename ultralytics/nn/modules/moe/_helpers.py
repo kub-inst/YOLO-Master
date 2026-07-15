@@ -15,19 +15,8 @@ from typing import Tuple, Dict, Optional, Union
 from torch.amp import autocast as _autocast
 
 
-# ---------------------------------------------------------------------------
-# Device-agnostic autocast wrapper
-# ---------------------------------------------------------------------------
-def autocast(enabled=True, **kwargs):
-    """Device-agnostic autocast wrapper. Falls back gracefully on non-CUDA devices."""
-    if torch.cuda.is_available():
-        return _autocast('cuda', enabled=enabled, **kwargs)
-    if torch.backends.mps.is_available():
-        return _autocast('mps', enabled=enabled, **kwargs)
-    # On CPU, autocast is not fully supported; disable to avoid warnings/errors
-    from contextlib import nullcontext
-    return nullcontext() if not enabled else nullcontext()
-
+# Re-export canonical autocast from _common to maintain public API compatibility.
+from ._common import autocast  # noqa: F401, E402
 
 # ---------------------------------------------------------------------------
 # Global auxiliary-loss registry (WeakKeyDictionary, thread-safe)

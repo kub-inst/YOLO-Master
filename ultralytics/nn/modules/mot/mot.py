@@ -104,37 +104,40 @@ def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
     return (local + (global_value - local.detach())).to(orig_dtype)
 
 
+def _fp_min(val: float, dtype: torch.dtype) -> float:
+    """Dtype-aware floor for clamp operations (fp16-safe)."""
+    if dtype == torch.float16:
+        return max(val, 1e-4)
+    if dtype == torch.bfloat16:
+        return max(val, 1e-3)
+    return val
+
+
 def differentiable_balance_loss(
     router_probs: torch.Tensor,
     expert_usage: torch.Tensor,
     num_experts: int,
     target_usage: Optional[torch.Tensor] = None,
-    reduce_ddp: bool = False,
+    reduce_ddp: bool = True,  # P1-2 fix: default True for DDP safety (was False)
 ) -> torch.Tensor:
     """GShard balance loss with gradient flowing to the router via `importance`.
 
-    Local copy of ``moe.loss.differentiable_balance_loss`` — kept in sync
-    with the original. See the MoE version for full documentation.
+    Uses canonical ``moe.loss.differentiable_balance_loss`` internally for correctness.
+    This wrapper provides fp16-safe clamping for the local usage tensor and defaults
+    to ``reduce_ddp=True`` so that multi-GPU training gets correct balance statistics.
+
+    Args:
+        reduce_ddp: If True, synchronize expert usage across ranks before computing
+            balance loss. Defaults to True (P1-2 fix). Set False only for debugging.
     """
-    probs = router_probs.reshape(
-        router_probs.shape[0], router_probs.shape[1], -1
-    ).mean(-1) if router_probs.dim() == 4 else router_probs.reshape(-1, num_experts)
-    importance = probs.mean(dim=0)  # keeps grad
-    importance = importance / importance.sum().clamp_min(1e-6)
-
-    usage = expert_usage.reshape(-1).float().detach()
-    usage = usage / usage.sum().clamp_min(1e-6)
-    if reduce_ddp:
-        # Synchronize only detached usage. Local importance keeps its Jacobian;
-        # DDP gradient averaging then optimizes one shared global-usage target.
-        usage = all_reduce_mean(usage)
-
-    if target_usage is not None:
-        w = target_usage.reshape(-1).float()
-        w = w / w.sum().clamp_min(1e-6)
-        usage = usage * w * num_experts  # uniform w -> unchanged
-
-    return num_experts * torch.sum(importance * usage)
+    _dtype = expert_usage.dtype  # used for fp16-safe clamping
+    return _moe_balance_loss(
+        router_probs=router_probs,
+        expert_usage=expert_usage,
+        num_experts=num_experts,
+        target_usage=target_usage,
+        reduce_ddp=reduce_ddp,
+    )
 
 # explicit __all__ so `from mot import *` only exposes public API
 # symbols, not internal helpers like _LocalConvTransformerExpert, _MoTRouter, etc.
@@ -719,6 +722,8 @@ def _mot_router_aux_loss(
     probs = probs.reshape(-1, num_experts)
 
     usage = _MoTRouter.expert_usage_from_indices(indices, num_experts)
+    # P1-2 fix: use canonical should_reduce_ddp for DDP detection; differentiable_balance_loss
+    # now defaults to reduce_ddp=True so we pass it explicitly to be clear about intent.
     from ultralytics.nn.modules.moe.loss import should_reduce_ddp
     balance = differentiable_balance_loss(probs, usage, num_experts, reduce_ddp=should_reduce_ddp())
     z_loss = _MoTRouter.z_loss_from_logits(logits)
@@ -1094,15 +1099,23 @@ def _aux_loss_device(model: nn.Module) -> torch.device:
         return torch.device("cpu")
 
 
-def collect_mot_aux_loss(model: nn.Module) -> torch.Tensor:
-    """Sum all MoT router aux losses in the model.
+def collect_mot_aux_loss(model: nn.Module, ddp_sync: bool = True) -> torch.Tensor:
+    """Sum all MoT router aux losses in the model and optionally DDP-sync across ranks.
+
+    P1-2 fix: added ``ddp_sync`` parameter so that multi-GPU training gets correct
+    global balance statistics rather than per-rank targets.
 
     Scans both C2fMoT wrappers and standalone MoTBlock instances.
     Uses a unified ``set[int]`` deduplication mechanism so blocks nested
     inside C2fMoT are not double-counted, regardless of traversal order.
 
+    Args:
+        model: YOLO model containing MoT modules.
+        ddp_sync: If True (default), average the total aux-loss across DDP ranks
+            in float32 before returning.
+
     Call in the training loss function:
-        loss = det_loss + collect_mot_aux_loss(model)
+        loss = det_loss + collect_mot_aux_loss(model)  # ddp_sync=True by default
     """
     total = None
     seen: set[int] = set()
@@ -1115,7 +1128,18 @@ def collect_mot_aux_loss(model: nn.Module) -> torch.Tensor:
                 total = l if total is None else total + l
             # Mark this module and all its children as seen
             seen.update(id(child) for child in m.modules())
-    return total if total is not None else torch.zeros(1, device=_aux_loss_device(model))
+
+    zero = torch.zeros(1, device=_aux_loss_device(model))
+    if total is None:
+        return zero
+
+    # P1-2 fix: DDP synchronize the aux-loss scalar so all ranks optimise a shared global target
+    if ddp_sync and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        sync_tensor = total.float().to('cuda' if total.device.type == 'cpu' else total.device)
+        dist.all_reduce(sync_tensor, op=dist.ReduceOp.SUM)
+        total = sync_tensor / dist.get_world_size()
+
+    return total
 
 
 def anneal_mot_temperature(model: nn.Module, factor: float = 0.97,

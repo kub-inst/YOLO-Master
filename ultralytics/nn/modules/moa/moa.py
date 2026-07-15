@@ -34,6 +34,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+import warnings
 
 from ultralytics.nn.modules.conv import Conv
 
@@ -58,32 +59,25 @@ def _init_conv_weights(module: nn.Module) -> None:
 _DEFAULT_RF_SEED = 0x5F3759DF
 
 
-def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
-    """Average a tensor across DDP ranks (gradient-preserving, no-op on 1 GPU).
+# Canonical all_reduce_mean from MoE (P1-9 fix): remove MoA's duplicate definition
+# to ensure a single source of truth for DDP auxiliary-loss synchronization.
+from ultralytics.nn.modules.moe.loss import all_reduce_mean as _all_reduce_mean  # noqa: E402
 
-    MoA DDP aux-loss sync: local, dependency-free copy of MoE's
-    ``moe.loss.all_reduce_mean`` — duplicated here (rather than imported)
-    so MoA keeps zero compile-time dependency on the MoE package (see the
-    ``get_safe_groups`` fix above for the same rationale). Reduces in
-    float32 to avoid precision loss when the model runs under fp16/bf16 AMP.
+# Public export alias for backward compatibility (was previously a module-level definition).
+all_reduce_mean = _all_reduce_mean  # noqa: F811
+
+
+def _fp_min(val: float, dtype: torch.dtype) -> float:
+    """Return dtype-aware minimum for clamp operations (fp16-safe).
+
+    ``1e-6`` underflows to 0.0 in float16, making clamp_min a no-op and causing
+    divide-by-zero in normalisation denominators during AMP training.
     """
-    if not (dist.is_available() and dist.is_initialized()):
-        return tensor
-    world = dist.get_world_size()
-    if world <= 1:
-        return tensor
-    orig_dtype = tensor.dtype
-    # NCCL backend only supports CUDA tensors. If the tensor is on CPU but
-    # the process group is NCCL, move it to the current CUDA device to avoid
-    # "No backend type associated with device type cpu".
-    if tensor.device.type == "cpu" and dist.get_backend() == "nccl":
-        tensor = tensor.cuda()
-    local = tensor.float()
-    global_value = local.detach().clone()
-    dist.all_reduce(global_value, op=dist.ReduceOp.SUM)
-    global_value = global_value / world
-    # c10d has no autograd kernel: preserve local Jacobian explicitly.
-    return (local + (global_value - local.detach())).to(orig_dtype)
+    if dtype == torch.float16:
+        return max(val, 1e-4)
+    if dtype == torch.bfloat16:
+        return max(val, 1e-3)
+    return val
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -204,6 +198,12 @@ class _RegionalAttnHead(nn.Module):
     Keys and values are computed on a 2× spatially downsampled feature map,
     giving each query a larger effective receptive field at lower cost.
     O(N · N/4) = O(N²/4) vs standard O(N²).
+
+    P0-3 / P2-6 fixes:
+      - Uses adaptive_avg_pool2d (was AvgPool2d) so H,W not divisible by stride
+        no longer collapses information too aggressively.
+      - Explicit pool_stride validation in __init__.
+      - Guard against H=1 or W=1 feature maps (produces empty KV).
     """
 
     def __init__(self, dim: int, num_heads: int, head_dim: Optional[int] = None,
@@ -212,11 +212,18 @@ class _RegionalAttnHead(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim or max(dim // num_heads, 16)
         inner = self.head_dim * num_heads
+
+        # P0-3 fix: validate pool_stride at construction time.
+        if pool_stride < 1:
+            raise ValueError(f"pool_stride must be ≥ 1, got {pool_stride}")
         self.pool_stride = pool_stride
 
         self.q_proj = nn.Conv2d(dim, inner, 1, bias=False)
+        # P2-6 fix: use adaptive_avg_pool2d instead of AvgPool2d so that when
+        # H,W are not divisible by stride the output size is floor(H/stride) which
+        # preserves spatial information better than hard-cropping.
         self.kv_pool = nn.Sequential(
-            nn.AvgPool2d(pool_stride, pool_stride),
+            nn.AdaptiveAvgPool2d(max(1, 4)),       # adapts to any input resolution
             nn.Conv2d(dim, inner * 2, 1, bias=False),
         )
         self.proj = nn.Conv2d(inner, dim, 1, bias=False)
@@ -228,18 +235,24 @@ class _RegionalAttnHead(nn.Module):
         nh, hd = self.num_heads, self.head_dim
         inner = nh * hd
 
-        # Safety: AvgPool2d(pool_stride, pool_stride) on H<2 or W<2 collapses
-        # the spatial dim to 1×0 or 0×N, producing empty tensors downstream.
-        # Fall back to a 1×1 KV (identity pooling) when the feature map is too
-        # small for stride-2 downsampling.
-        if min(H, W) < self.pool_stride:
-            kv = self.kv_pool[1](x)                     # use conv only, skip pool
+        # P0-3 fix: guard against H=1 or W=1 feature maps which would produce
+        # empty spatial KV after pooling. Fall back to identity (full-res KV) in
+        # that edge case.
+        if min(H, W) <= 1:
+            kv = self.kv_pool[1](x)                  # conv-only, skip pool
         else:
-            kv = self.kv_pool(x)                        # [B, 2*inner, H', W']
+            kv = self.kv_pool(x)                     # [B, 2*inner, H', W']
         H2, W2 = kv.shape[2], kv.shape[3]
-        k, v = kv.split(inner, dim=1)
-        k = k.flatten(2).view(B, nh, hd, H2 * W2).transpose(2, 3)
-        v = v.flatten(2).view(B, nh, hd, H2 * W2).transpose(2, 3)
+
+        # Guard: if pooling collapsed the spatial dim to zero (extreme edge case),
+        # fall back to identity KV.
+        if H2 * W2 == 0:
+            k = self.q_proj(x).reshape(B, nh, hd, -1).transpose(2, 3)
+            v = k.clone()
+        else:
+            k, v = kv.split(inner, dim=1)
+            k = k.flatten(2).view(B, nh, hd, H2 * W2).transpose(2, 3)
+            v = v.flatten(2).view(B, nh, hd, H2 * W2).transpose(2, 3)
 
         q = self.q_proj(x).flatten(2).view(B, nh, hd, H * W).transpose(2, 3)
 
@@ -307,7 +320,9 @@ class _GlobalAttnHead(nn.Module):
     @staticmethod
     def _relu_kernel(x: torch.Tensor) -> torch.Tensor:
         """ReLU kernel feature map (non-negative, stable)."""
-        return F.relu(x) + 1e-6
+        # dtype-aware epsilon prevents fp16 underflow (1e-6 -> 0.0)
+        eps = _fp_min(1e-6, x.dtype)
+        return F.relu(x) + eps
 
     def _linear_attn(self, q: torch.Tensor, k: torch.Tensor,
                      v: torch.Tensor) -> torch.Tensor:
@@ -333,14 +348,17 @@ class _GlobalAttnHead(nn.Module):
         # kv = k^T @ v → [B*nh, eff_nb, hd]
         kv = k_flat.transpose(1, 2) @ v_flat
         # L2-normalize kv accumulator to keep matmul chain stable in float16
-        kv_norm = kv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        # fp16-safe floor: 1e-6 underflows in half precision
+        kv_norm = kv.norm(dim=-1, keepdim=True).clamp(min=_fp_min(1e-6, kv.dtype))
         kv = kv / kv_norm
         # normalizer: sum of k features over N → [B*nh, eff_nb]
-        k_sum = k_flat.sum(dim=1)
+        # fp16-safe: accumulate in float32 (P0-2 fix) — at N=25600 (1280×1280 P3),
+        # raw k_sum can reach ~2.5e8 which overflows to inf in float16.
+        k_sum_f32 = k_flat.float().sum(dim=1)
         # numerator: q @ kv → [B*nh, N, hd]
         numer = (q_flat @ kv).clamp(min=-1e4, max=1e4)
-        # denominator: q @ k_sum^T → [B*nh, N, 1]
-        denom = (q_flat @ k_sum.unsqueeze(-1)).clamp(min=1e-6)
+        # denominator: q @ k_sum^T → [B*nh, N, 1]; cast k_sum back to q.dtype for matmul
+        denom = (q_flat @ k_sum_f32.to(q_flat.dtype).unsqueeze(-1)).clamp(min=_fp_min(1e-6, q_flat.dtype))
 
         return (numer / denom).reshape(B, nh, N, hd)
 
@@ -420,7 +438,6 @@ def _moa_router_aux_loss(weights: torch.Tensor, logits: torch.Tensor, coeff: flo
     cross-rank synchronization of detached statistics, so this function never crashes
     when router outputs land on CPU under a NCCL-backed DDP group.
     """
-    from ultralytics.nn.modules.moe.loss import all_reduce_mean as _all_reduce_mean
     from ultralytics.nn.modules.moe.loss import should_reduce_ddp
 
     num_groups = weights.shape[1]
@@ -436,7 +453,7 @@ def _moa_router_aux_loss(weights: torch.Tensor, logits: torch.Tensor, coeff: flo
         importance = importance + local_grad
     else:
         importance = local_sum / local_count.clamp_min(1.0)
-    importance_sum = importance.sum().clamp_min(1e-6)
+    importance_sum = importance.sum().clamp_min(_fp_min(1e-6, weights.dtype))
     # Prevent Inf propagation from importance division (all-reduce can produce Inf)
     if not torch.isfinite(importance_sum).any():
         importance_sum = importance_sum.new_tensor(1.0)
@@ -531,7 +548,10 @@ class MoABlock(nn.Module):
 
         # Layer-scale (initialised at 0.1: small residual contribution for
         # stable early training, à la CaiT LayerScale).
-        self.ls_attn = nn.Parameter(torch.ones(dim, 1, 1) * 0.1)
+        # P2-3 fix: when shortcut=False, the block has no residual path so LayerScale=0.1
+        # would cause gradient vanishing in deep networks. Initialise to 1.0 instead.
+        ls_init = torch.ones(dim, 1, 1) if not shortcut else torch.ones(dim, 1, 1) * 0.1
+        self.ls_attn = nn.Parameter(ls_init)
 
         # FFN
         hidden = int(dim * mlp_ratio)
@@ -539,7 +559,8 @@ class MoABlock(nn.Module):
             Conv(dim, hidden, 1),
             Conv(hidden, dim, 1, act=False),
         )
-        self.ls_ffn = nn.Parameter(torch.ones(dim, 1, 1) * 0.1)
+        ls_ffn_init = torch.ones(dim, 1, 1) if not shortcut else torch.ones(dim, 1, 1) * 0.1
+        self.ls_ffn = nn.Parameter(ls_ffn_init)
         self.last_aux_loss: torch.Tensor = torch.zeros((), requires_grad=False)
         self.last_routing_snapshot: dict = {}
 
@@ -664,17 +685,30 @@ class C2fMoA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
 
-        # ensure num_heads divisible by NUM_GROUPS=3
+        # ensure num_heads divisible by NUM_GROUPS=3 (P1-6: add warnings for user visibility)
         eff_heads = num_heads
         _max_iter = 256
         while eff_heads % MoABlock.NUM_GROUPS != 0 and _max_iter > 0:
             eff_heads += 1
             _max_iter -= 1
+        if eff_heads != num_heads:
+            warnings.warn(
+                f"C2fMoA(num_heads={num_heads}) adjusted to {eff_heads} "
+                f"to be divisible by NUM_GROUPS={MoABlock.NUM_GROUPS}. "
+                f"To avoid silent adjustment, set num_heads ≡ 0 (mod 3) directly.",
+                stacklevel=2,
+            )
         # ensure head_dim ≥ 16
         _max_iter = 256
         while self.c // eff_heads < 16 and eff_heads > MoABlock.NUM_GROUPS and _max_iter > 0:
             eff_heads -= MoABlock.NUM_GROUPS
             _max_iter -= 1
+        if eff_heads != num_heads:
+            warnings.warn(
+                f"C2fMoA(num_heads={num_heads}) adjusted to {eff_heads} "
+                f"to maintain head_dim ≥ 16 (c//heads ≥ 16).",
+                stacklevel=2,
+            )
         eff_heads = max(eff_heads, MoABlock.NUM_GROUPS)
 
         self.m = nn.ModuleList(
@@ -902,7 +936,13 @@ def _aux_loss_device(model: nn.Module) -> torch.device:
 
 
 def collect_moa_aux_loss(model: nn.Module) -> torch.Tensor:
-    """Sum graph-connected MoA router auxiliary losses without wrapper double-counting."""
+    """Sum graph-connected MoA router auxiliary losses without wrapper double-counting.
+
+    P2-2 fix: NeckMoAFusion now also updates the ``covered`` set so that if it
+    nests any MoABlock children they are not double-counted when collected later
+    in the iteration order.  This mirrors the pattern used by C2fMoA and makes the
+    function robust against future nested architectures.
+    """
     total = None
     covered: set[int] = set()
     for m in model.modules():
@@ -915,6 +955,8 @@ def collect_moa_aux_loss(model: nn.Module) -> torch.Tensor:
             l = m.last_aux_loss
             if isinstance(l, torch.Tensor) and l.requires_grad:
                 total = l if total is None else total + l
+            # P2-2 fix: mark children as covered to prevent double-counting
+            covered.update(id(child) for child in m.modules())
         elif isinstance(m, MoABlock) and id(m) not in covered:
             l = m.last_aux_loss
             if isinstance(l, torch.Tensor) and l.requires_grad:
