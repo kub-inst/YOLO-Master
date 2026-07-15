@@ -2327,6 +2327,10 @@ class BaseTrainer:
             raise RuntimeError(f"Training failed: NaN persisted for {self.nan_recovery_attempts} epochs")
         LOGGER.warning(f"{reason} detected (attempt {self.nan_recovery_attempts}/3), recovering from {healthy.name}...")
         self._model_train()
+        # ``optimizer_step`` has already reduced GradScaler after this overflow.
+        # Preserve that backoff instead of restoring the older checkpoint scale,
+        # otherwise every retry starts at the same overflowing scale.
+        recovery_scaler_state = deepcopy(self.scaler.state_dict()) if gradient_nonfinite else None
         ckpt = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
         ema_state = ckpt["ema"].float().state_dict()
         target = unwrap_model(self.model)
@@ -2340,6 +2344,8 @@ class BaseTrainer:
             if missing:
                 LOGGER.warning(f"[NaN recovery] EMA state_dict missing keys (non-fatal): {missing}")
         self._load_checkpoint_state(ckpt)
+        if recovery_scaler_state is not None:
+            self.scaler.load_state_dict(recovery_scaler_state)
         self._gradient_nonfinite = False
         self._nonfinite_diagnostic = None
         del ckpt, ema_state

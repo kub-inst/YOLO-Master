@@ -106,6 +106,17 @@ def test_nonfinite_loss_recovers_from_healthy_checkpoint(tmp_path):
     t._load_checkpoint_state.assert_called_once()
 
 
+def test_gradient_recovery_preserves_reduced_scaler_state(tmp_path):
+    t = recovery_trainer(tmp_path, loss=1.0)
+    t._gradient_nonfinite = True
+    t.scaler = MagicMock()
+    t.scaler.state_dict.return_value = {"scale": 32768.0}
+    write_healthy(t.healthy)
+
+    assert t._handle_nan_recovery(0) is True
+    t.scaler.load_state_dict.assert_called_once_with({"scale": 32768.0})
+
+
 def test_checkpoint_restore_tolerates_missing_lazy_ema_buffer():
     t = object.__new__(BaseTrainer)
     t.model = nn.Linear(1, 1)
