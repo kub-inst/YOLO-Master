@@ -1920,7 +1920,7 @@ class BaseTrainer:
                         # Directly replace the registered buffer to ensure the module
                         # sees the new device placement.
                         try:
-                            cuda_buf = buffer.to(self.device, non_blocking=True)
+                            cuda_buf = buffer.to(self.device, non_blocking=True).detach()
                             module._buffers[name] = cuda_buf
                             buffer = cuda_buf  # update local reference for broadcast
                         except RuntimeError:

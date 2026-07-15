@@ -86,7 +86,15 @@ def _get_mixture_loss_ema(model: nn.Module | None) -> dict[str, float] | None:
     # Determine target device from model parameters so the buffer stays aligned
     # with the model even after ``.to(device)`` calls.
     parameter = next(model.parameters(), None)
-    target_device = parameter.device if parameter is not None else torch.device("cpu")
+    if parameter is not None:
+        target_device = parameter.device
+    elif torch.cuda.is_available():
+        # No parameters available (e.g. frozen params, stripped model).
+        # Default to CUDA so the buffer doesn't end up on CPU, which would
+        # break NCCL validation broadcasts.
+        target_device = torch.device("cuda")
+    else:
+        target_device = torch.device("cpu")
     if buf is None:
         defaults = [_MIXTURE_LOSS_EMA_DEFAULTS[k] for k in _MIXTURE_LOSS_EMA_KEYS]
         model.register_buffer(
