@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Dict, Optional, Union
 
-from .utils import FlopsUtils, get_safe_groups, BatchedExpertComputation
+from .utils import FlopsUtils, get_safe_groups, BatchedExpertComputation, index_add_aligned_, cast_like
 from .experts import (
     OptimizedSimpleExpert, FusedGhostExpert, SimpleExpert, GhostExpert,
     InvertedResidualExpert, EfficientExpertGroup, SpatialExpert, SharedInvertedExpertGroup
@@ -2363,7 +2363,8 @@ class DiversifiedExpertGroup(nn.Module):
                 w_k = weights[:, k] * valid_mask[:, k].to(weights.dtype)
                 idx_exp = idx_k.view(B, 1, 1, 1, 1).expand(B, 1, self.out_channels, H, W)
                 selected = torch.gather(all_projs, 1, idx_exp).squeeze(1)
-                output = output + selected * w_k.view(B, 1, 1, 1)
+                weighted = selected.to(dtype=output.dtype) * w_k.view(B, 1, 1, 1).to(dtype=output.dtype)
+                output = output + weighted
             return output
 
         active_experts = torch.unique(indices[valid_mask]).to(torch.long).tolist()
@@ -2373,8 +2374,11 @@ class DiversifiedExpertGroup(nn.Module):
             expert_mask = (indices == expert_idx) & valid_mask
             batch_indices, k_indices = torch.where(expert_mask)
             expert_out = projection(dw_feat[batch_indices])
-            expert_weight = weights[batch_indices, k_indices].view(-1, 1, 1, 1).to(expert_out.dtype)
-            output.index_add_(0, batch_indices, expert_out * expert_weight)
+            expert_weight = weights[batch_indices, k_indices].view(-1, 1, 1, 1)
+            # AMP: GroupNorm promotes expert_out to fp32 while ``output`` stays
+            # fp16. Multiply in fp32 then align for index_add_.
+            weighted = expert_out.float() * expert_weight.float()
+            index_add_aligned_(output, 0, batch_indices, weighted)
 
         return output
 
