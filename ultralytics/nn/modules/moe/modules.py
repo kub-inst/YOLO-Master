@@ -960,11 +960,14 @@ class OptimizedMOEImproved(nn.Module):
 
         # 2) Shared expert compute (always active)
         shared_out = self.shared_expert(x)
+        if not torch.isfinite(shared_out).all():
+            raise RuntimeError("OptimizedMOEImproved shared expert output contains NaN/Inf")
 
         # 3) Sparse expert compute with STOP GRADIENT on routing weights
         # This prevents main task loss from dominating router learning direction.
         # Router should only learn from MoE auxiliary loss (balance + z-loss).
-        expert_output = torch.zeros(B, self.out_channels, H, W, device=x.device, dtype=x.dtype)
+        accumulator_dtype = torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
+        expert_output = torch.zeros(B, self.out_channels, H, W, device=x.device, dtype=accumulator_dtype)
 
         # Expert dropout: randomly disable experts to prevent collapse.
         # Only after warmup so it doesn't fight progressive-sparsity scheduling.
@@ -1022,15 +1025,22 @@ class OptimizedMOEImproved(nn.Module):
                     # Accumulate results
                     expert_output.index_add_(0, batch_idx, out.to(expert_output.dtype) * w.to(expert_output.dtype))
 
-        # Guard against activation explosion on routing collapse (all tokens -> 1 expert)
-        expert_output = expert_output.clamp_(-1e4, 1e4)
+        if not torch.isfinite(expert_output).all():
+            raise RuntimeError("OptimizedMOEImproved sparse expert aggregation contains NaN/Inf")
 
-        final_output = shared_out + expert_output
-        
+        final_output = shared_out.to(expert_output.dtype) + expert_output
+        if not torch.isfinite(final_output).all():
+            raise RuntimeError("OptimizedMOEImproved final output contains NaN/Inf")
+        final_output = final_output.to(x.dtype)
+        if not torch.isfinite(final_output).all():
+            raise RuntimeError("OptimizedMOEImproved final output overflowed during dtype conversion")
+
         # Add residual connection if dimensions match (skipped when the outer
         # block owns the residual, see add_residual)
         if self.add_residual and self.in_channels == self.out_channels:
             final_output = final_output + x
+            if not torch.isfinite(final_output).all():
+                raise RuntimeError("OptimizedMOEImproved residual output contains NaN/Inf")
 
         # 4) Compute and return Loss during training
         if self.training and loss_dict:

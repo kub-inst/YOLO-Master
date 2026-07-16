@@ -1,6 +1,7 @@
 # 🐧Please note that this file has been modified by Tencent on 2026/02/07. All Tencent Modifications are Copyright (C) 2026 Tencent.
 """Efficient routers for Mixture-of-Experts models"""
 import json
+import math
 import os
 import torch
 import torch.nn as nn
@@ -296,6 +297,8 @@ class EfficientSpatialRouter(BaseRouter):
 
     def forward(self, x, top_k: Optional[int] = None):
         _validate_router_input(x, _get_router_in_channels(self.router), context="EfficientSpatialRouter")
+        if not math.isfinite(float(self.noise_std)):
+            raise MoERouterError("EfficientSpatialRouter noise_std must be finite")
         B, C, H, W = x.shape
         # Pre-pooling optimization
         if H > self.pool_scale and W > self.pool_scale:
@@ -304,10 +307,14 @@ class EfficientSpatialRouter(BaseRouter):
             x_in = x
 
         out = self.router(x_in)  # [B, E, H', W']
+        if not torch.isfinite(out).all():
+            raise MoERouterError("EfficientSpatialRouter internal output contains NaN/Inf")
         # Spatial reduction is sensitive to fp16 cancellation/underflow on
         # large feature maps.  Promote only this routing statistic; convolution
         # remains governed by the caller's autocast policy.
         global_logits = out.float().mean(dim=[2, 3])  # [B, E]
+        if not torch.isfinite(global_logits).all():
+            raise MoERouterError("EfficientSpatialRouter global logits contain NaN/Inf")
 
         return self._process_logits(global_logits, self.noise_std, self.training, top_k=top_k)
 

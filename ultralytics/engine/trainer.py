@@ -1466,7 +1466,7 @@ class BaseTrainer:
                 # ``self.epoch``; use the resumed epoch boundary in that case.
                 "epoch": getattr(self, "epoch", self.start_epoch - 1),
                 "best_fitness": self.best_fitness,
-                "model": None,
+                "model": deepcopy(unwrap_model(self.model)).half(),
                 "ema": deepcopy(unwrap_model(self.ema.ema)).half(),
                 "updates": self.ema.updates,
                 "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
@@ -2416,30 +2416,43 @@ class BaseTrainer:
             raise RuntimeError(f"Training failed: NaN persisted for {self.nan_recovery_attempts} epochs")
         LOGGER.warning(f"{reason} detected (attempt {self.nan_recovery_attempts}/3), recovering from {healthy.name}...")
         self._model_train()
-        # ``optimizer_step`` has already reduced GradScaler after this overflow.
-        # Preserve that backoff instead of restoring the older checkpoint scale,
-        # otherwise every retry starts at the same overflowing scale.
-        recovery_scaler_state = deepcopy(self.scaler.state_dict()) if gradient_nonfinite else None
+        # Preserve reduced scale after gradient overflow. A non-finite loss has
+        # no reliable found_inf record, so back off deterministically as well.
+        recovery_scaler_state = None
+        if gradient_nonfinite or loss_nonfinite:
+            scaler = getattr(self, "scaler", None)
+            if scaler is not None:
+                if loss_nonfinite and not gradient_nonfinite:
+                    current_scale = scaler.get_scale()
+                    scaler.update(new_scale=max(current_scale * 0.5, 1.0))
+                recovery_scaler_state = deepcopy(scaler.state_dict())
         ckpt = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
-        ema_state = ckpt["ema"].float().state_dict()
+        model_snapshot = ckpt.get("model")
+        if model_snapshot is None:
+            raise RuntimeError(
+                "Healthy checkpoint lacks online model state; refusing to restore EMA weights with optimizer state."
+            )
+        model_state = model_snapshot.float().state_dict()
         target = unwrap_model(self.model)
         if getattr(target, "lora_enabled", False):
-            load_lora_compatible_state_dict(target, ema_state, context="NaN recovery checkpoint EMA", adapter_only=True)
+            load_lora_compatible_state_dict(target, model_state, context="NaN recovery checkpoint model", adapter_only=True)
         else:
-            # Use strict=False because EMA may lack lazy-init buffers (e.g.
-            # _mixture_loss_ema_buf) that were registered on the live model after
-            # the EMA snapshot was created.
-            missing, unexpected = target.load_state_dict(ema_state, strict=False)
-            if missing:
-                LOGGER.warning(f"[NaN recovery] EMA state_dict missing keys (non-fatal): {missing}")
+            missing, unexpected = target.load_state_dict(model_state, strict=False)
+            if missing or unexpected:
+                LOGGER.warning(
+                    f"[NaN recovery] model state_dict compatibility: missing={missing}, unexpected={unexpected}"
+                )
         self._load_checkpoint_state(ckpt)
+        optimizer = getattr(self, "optimizer", None)
+        if optimizer is not None:
+            optimizer.zero_grad()
         self._reset_non_checkpoint_moe_runtime_state()
         if recovery_scaler_state is not None:
             self.scaler.load_state_dict(recovery_scaler_state)
         self._gradient_nonfinite = False
         self._ema_nonfinite = False
         self._nonfinite_diagnostic = None
-        del ckpt, ema_state
+        del ckpt, model_state
         self.scheduler.last_epoch = epoch - 1
         return True
 

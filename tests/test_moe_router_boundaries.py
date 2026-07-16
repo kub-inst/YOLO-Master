@@ -156,6 +156,17 @@ class TestEfficientSpatialRouterBoundaries:
         with pytest.raises(ShapeMismatchError):
             spatial_router(x)
 
+    @pytest.mark.parametrize("noise_std", [float("nan"), float("inf")])
+    def test_nonfinite_noise_std_raises(self, spatial_router, noise_std):
+        spatial_router.noise_std = noise_std
+        with pytest.raises(MoERouterError, match="noise_std"):
+            spatial_router(_valid_input())
+
+    def test_nonfinite_internal_router_output_raises(self, spatial_router, monkeypatch):
+        monkeypatch.setattr(spatial_router.router, "forward", lambda _: torch.full((2, NUM_EXPERTS, 1, 1), float("nan")))
+        with pytest.raises(MoERouterError, match="internal output"):
+            spatial_router(_valid_input())
+
 
 # =============================================================================
 # AdaptiveRoutingLayer boundary tests

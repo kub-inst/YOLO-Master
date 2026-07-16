@@ -122,6 +122,30 @@ def test_routing_gradient_flows_by_default():
     )
 
 
+def test_improved_moe_rejects_nonfinite_shared_expert_output(monkeypatch):
+    m = OptimizedMOEImproved(32, 32, num_experts=4, top_k=2, progressive_sparsity=False).eval()
+    monkeypatch.setattr(m.shared_expert, "forward", lambda x: torch.full_like(x, float("nan")))
+    with pytest.raises(RuntimeError, match="shared expert"):
+        m(torch.randn(2, 32, 16, 16))
+
+
+def test_improved_moe_rejects_nonfinite_sparse_aggregation(monkeypatch):
+    m = OptimizedMOEImproved(32, 32, num_experts=4, top_k=2, progressive_sparsity=False).eval()
+    monkeypatch.setattr(m.experts[0], "forward", lambda x: torch.full_like(x, float("nan")))
+    monkeypatch.setattr(m.routing, "forward", lambda x, top_k: (torch.tensor([[1.0, 0.0]], device=x.device).expand(x.shape[0], -1), torch.tensor([[0, 1]], device=x.device).expand(x.shape[0], -1), {}))
+    with pytest.raises(RuntimeError, match="sparse expert aggregation"):
+        m(torch.randn(2, 32, 16, 16))
+
+
+def test_improved_moe_rejects_nonfinite_after_low_precision_output_conversion(monkeypatch):
+    m = OptimizedMOEImproved(32, 32, num_experts=4, top_k=2, progressive_sparsity=False).eval().half()
+    monkeypatch.setattr(m.shared_expert, "forward", lambda x: torch.full_like(x.float(), 1e5))
+    monkeypatch.setattr(m.routing, "forward", lambda x, top_k: (torch.tensor([[1.0, 0.0]], device=x.device).expand(x.shape[0], -1), torch.tensor([[0, 1]], device=x.device).expand(x.shape[0], -1), {}))
+    monkeypatch.setattr(m.experts[0], "forward", lambda x: torch.zeros_like(x))
+    with pytest.raises(RuntimeError, match="dtype conversion"):
+        m(torch.randn(2, 32, 16, 16, dtype=torch.float16))
+
+
 def test_routing_detach_isolates_router():
     """With detach_routing=True, main-task grad must NOT reach router weights."""
     torch.manual_seed(0)

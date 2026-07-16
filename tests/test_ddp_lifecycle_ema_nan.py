@@ -43,7 +43,8 @@ def recovery_trainer(tmp_path, loss=1.0, fitness=0.0, best_fitness=0.4):
 
 
 def write_healthy(path):
-    torch.save({"ema": nn.Linear(1, 1), "optimizer": None, "scaler": None, "best_fitness": 0.4, "updates": 0}, path)
+    model = nn.Linear(1, 1)
+    torch.save({"model": model, "ema": nn.Linear(1, 1), "optimizer": None, "scaler": None, "best_fitness": 0.4, "updates": 0}, path)
 
 
 def test_nccl_skips_nonpersistent_cpu():
@@ -99,6 +100,13 @@ def test_bootstrap_checkpoint_serializes_before_training_epoch_is_set(tmp_path):
     assert checkpoint["epoch"] == 6
 
 
+def test_recovery_rejects_legacy_checkpoint_without_online_model(tmp_path):
+    t = recovery_trainer(tmp_path, loss=float("nan"))
+    torch.save({"ema": nn.Linear(1, 1), "optimizer": None, "scaler": None, "best_fitness": 0.4, "updates": 0}, t.healthy)
+    with pytest.raises(RuntimeError, match="lacks online model state"):
+        t._handle_nan_recovery(0)
+
+
 def test_nonfinite_loss_recovers_from_healthy_checkpoint(tmp_path):
     t = recovery_trainer(tmp_path, loss=float("nan"))
     write_healthy(t.healthy)
@@ -136,6 +144,19 @@ def test_validate_skips_nonfinite_ema_and_marks_recovery():
     assert fitness != fitness
     assert t._ema_nonfinite is True
     t.validator.assert_not_called()
+
+
+def test_loss_recovery_halves_scaler_and_clears_gradients(tmp_path):
+    t = bootstrap_trainer(tmp_path)
+    t.loss = torch.tensor(float("nan"))
+    t._gradient_nonfinite = False
+    t._bootstrap_healthy_checkpoint()
+    t.model.weight.grad = torch.full_like(t.model.weight, float("nan"))
+    initial_scale = t.scaler.get_scale()
+
+    assert t._handle_nan_recovery(0) is True
+    assert t.scaler.get_scale() == max(initial_scale * 0.5, 1.0)
+    assert t.model.weight.grad is None
 
 
 def test_gradient_recovery_preserves_reduced_scaler_state(tmp_path):
@@ -227,7 +248,7 @@ def test_bootstrap_checkpoint_precedes_first_nonfinite_recovery(tmp_path):
     with torch.no_grad():
         t.model.weight.fill_(99.0)
     assert t._handle_nan_recovery(0) is True
-    assert torch.allclose(t.model.weight, payload["ema"].float().weight)
+    assert torch.allclose(t.model.weight, payload["model"].float().weight)
     assert t.optimizer.state_dict()["state"] == {}
     assert t.scaler.state_dict() == payload["scaler"]
     assert t.ema.updates == payload["updates"]
