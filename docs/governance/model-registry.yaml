@@ -1,0 +1,90 @@
+schema_version: 1
+last_verified_commit: working-tree-20260716-p0
+models:
+  - name: yolo-master-v0.10-moa-n
+    path: ultralytics/cfg/models/master/v0_10/det/yolo-master-moa-n.yaml
+    task: detect
+    status: experimental
+    blocks:
+      - VisualEnhancedAdaptiveGateMoE
+      - C2fMoA
+    verified: [parse, forward, unit_tests]
+    export: {onnx: unverified, tensorrt: unverified}
+
+  - name: yolo-master-v0.10-mot-n
+    path: ultralytics/cfg/models/master/v0_10/det/yolo-master-mot-n.yaml
+    task: detect
+    status: experimental
+    blocks:
+      - VisualEnhancedAdaptiveGateMoE
+      - C2fMoT
+    verified: [parse, forward, unit_tests]
+    export: {onnx: partial, tensorrt: unverified}
+
+  - name: yolo-master-v0.10-moa-mot-n
+    path: ultralytics/cfg/models/master/v0_10/det/yolo-master-moa-mot-n.yaml
+    task: detect
+    status: experimental
+    blocks:
+      - VisualEnhancedAdaptiveGateMoE
+      - C2fMoA
+      - C2fMoT
+    verified: [parse, forward, unit_tests]
+    export: {onnx: partial, tensorrt: unverified}
+
+  - name: yolo26-master-n
+    path: ultralytics/cfg/models/26/yolo26-master-n.yaml
+    task: detect
+    status: experimental
+    blocks:
+      - A2C2fMoE
+    verified: [parse, forward, unit_tests]
+    export: {onnx: unverified, tensorrt: unverified}
+
+  - name: yolo26-n
+    path: ultralytics/cfg/models/26/yolo26.yaml
+    task: detect
+    status: stable
+    blocks: [C3k2, C2PSA]
+    verified: [parse, forward, unit_tests]
+    export: {onnx: unverified, tensorrt: unverified}
+
+  - name: yolo26-seg-n
+    path: ultralytics/cfg/models/26/yolo26-seg.yaml
+    task: segment
+    status: stable
+    blocks: [Segment26]
+    verified: [parse, forward, unit_tests]
+    export: {onnx: unverified, tensorrt: unverified}
+
+  - name: yolo26-pose-n
+    path: ultralytics/cfg/models/26/yolo26-pose.yaml
+    task: pose
+    status: stable
+    blocks: [Pose26]
+    verified: [parse, forward]
+    export: {onnx: unverified, tensorrt: unverified}
+
+  - name: yolo26-obb-n
+    path: ultralytics/cfg/models/26/yolo26-obb.yaml
+    task: obb
+    status: stable
+    blocks: [OBB26]
+    verified: [parse, forward]
+    export: {onnx: unverified, tensorrt: unverified}
+
+  - name: yoloe-26-n
+    path: ultralytics/cfg/models/26/yoloe-26.yaml
+    task: detect
+    status: experimental
+    blocks: [YOLOEDetect26]
+    verified: [parse, prompt_aware_build]
+    export: {onnx: unverified, tensorrt: unverified}
+
+  - name: yoloe-26-seg-n
+    path: ultralytics/cfg/models/26/yoloe-26-seg.yaml
+    task: segment
+    status: experimental
+    blocks: [YOLOESegment26]
+    verified: [parse, prompt_aware_build]
+    export: {onnx: unverified, tensorrt: unverified}
