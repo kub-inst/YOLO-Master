@@ -170,6 +170,17 @@ def test_gradient_recovery_preserves_reduced_scaler_state(tmp_path):
     t.scaler.load_state_dict.assert_called_once_with({"scale": 32768.0})
 
 
+def test_nonfinite_amp_recovery_switches_to_fp32(tmp_path):
+    t = bootstrap_trainer(tmp_path)
+    t.amp = True
+    t._gradient_nonfinite = True
+    write_healthy(t.healthy)
+
+    assert t._handle_nan_recovery(0) is True
+    assert t.amp is False
+    assert t.scaler.is_enabled() is False
+
+
 def test_nonfinite_gradient_is_consumed_by_scaler_before_clear():
     class RecordingScaler:
         def __init__(self):

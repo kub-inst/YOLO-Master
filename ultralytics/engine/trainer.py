@@ -57,6 +57,7 @@ from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_m
 from ultralytics.utils.dist import collect_ddp_error_logs, ddp_cleanup, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
 from ultralytics.utils.plotting import plot_results
+from ultralytics.utils.loss import _get_mixture_loss_ema
 from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
@@ -1471,6 +1472,11 @@ class BaseTrainer:
 
     def _serialize_checkpoint(self):
         """Serialize the complete resume state once for normal and recovery checkpoints."""
+        model = unwrap_model(self.model)
+        ema_model = unwrap_model(self.ema.ema) if self.ema else None
+        _get_mixture_loss_ema(model)
+        if ema_model is not None:
+            _get_mixture_loss_ema(ema_model)
         buffer = io.BytesIO()
         torch.save(
             {
@@ -2364,9 +2370,11 @@ class BaseTrainer:
         if ckpt.get("scaler") is not None:
             self.scaler.load_state_dict(ckpt["scaler"])
         if self.ema and ckpt.get("ema"):
+            _get_mixture_loss_ema(unwrap_model(self.model))
             self.ema = ModelEMA(self.model)  # validation with EMA creates inference tensors that can't be updated
             ema_state = ckpt["ema"].float().state_dict()
             ema_target = unwrap_model(self.ema.ema)
+            _get_mixture_loss_ema(ema_target)
             if getattr(ema_target, "lora_enabled", False):
                 # Only restore adapter weights into EMA; base weights are copied
                 # from the freshly loaded pre-trained model above.
@@ -2432,10 +2440,11 @@ class BaseTrainer:
             raise RuntimeError(f"Training failed: NaN persisted for {self.nan_recovery_attempts} epochs")
         LOGGER.warning(f"{reason} detected (attempt {self.nan_recovery_attempts}/3), recovering from {healthy.name}...")
         self._model_train()
+        amp_recovery = bool(getattr(self, "amp", False)) and (flags[0] or flags[2])
         # Preserve reduced scale after gradient overflow. A non-finite loss has
         # no reliable found_inf record, so back off deterministically as well.
         recovery_scaler_state = None
-        if gradient_nonfinite or loss_nonfinite:
+        if (gradient_nonfinite or loss_nonfinite) and not amp_recovery:
             scaler = getattr(self, "scaler", None)
             if scaler is not None:
                 if loss_nonfinite and not gradient_nonfinite:
@@ -2450,6 +2459,7 @@ class BaseTrainer:
             )
         model_state = model_snapshot.float().state_dict()
         target = unwrap_model(self.model)
+        _get_mixture_loss_ema(target)
         if getattr(target, "lora_enabled", False):
             load_lora_compatible_state_dict(target, model_state, context="NaN recovery checkpoint model", adapter_only=True)
         else:
@@ -2463,7 +2473,15 @@ class BaseTrainer:
         if optimizer is not None:
             optimizer.zero_grad()
         self._reset_non_checkpoint_moe_runtime_state()
-        if recovery_scaler_state is not None:
+        if amp_recovery:
+            self.amp = False
+            self.scaler = (
+                torch.amp.GradScaler("cuda", enabled=False)
+                if TORCH_2_4
+                else torch.cuda.amp.GradScaler(enabled=False)
+            )
+            LOGGER.warning("[NaN recovery] Disabling AMP globally and retrying from the healthy checkpoint in FP32.")
+        elif recovery_scaler_state is not None:
             self.scaler.load_state_dict(recovery_scaler_state)
         self._gradient_nonfinite = False
         self._ema_nonfinite = False
