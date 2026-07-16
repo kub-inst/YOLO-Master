@@ -22,7 +22,7 @@ backbone:
   - [-1, 2, A2C2fMoE, [512, True, 1, False, 2.0, 0.5, 1, True, 8, 2]] # 6 - MoE at P4 (num_experts=8, top_k=2)
   - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
   - [-1, 2, A2C2fMoE, [1024, True, 1, False, 2.0, 0.5, 1, True, 16, 2]] # 8 - MoE at P5 (num_experts=16, top_k=2)
-  - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
+  - [-1, 1, SPPF, [1024, 5]] # 9
   - [-1, 2, C2PSA, [1024]] # 10
 
 # YOLO26-Master detection head

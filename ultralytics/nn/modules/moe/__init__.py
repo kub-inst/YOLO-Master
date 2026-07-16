@@ -85,6 +85,14 @@ from .scheduler import (
     MapSaturationScheduleState,
     compute_gini,
 )
+from .config import (
+    MIXTURE_DEFAULTS,
+    CLI_FIELDS,
+    ResolvedMixtureConfig,
+    annotate_mixture_yaml_config,
+    resolve_mixture_config,
+    apply_mixture_config,
+)
 
 
 # ── API Stability Tiers ──────────────────────────────────────────────
@@ -121,6 +129,22 @@ EXPERIMENTAL_MOE_CLASSES = frozenset({
     "VisualEnhancedAdaptiveGateMoE",
 })
 
+# LEGACY: kept for checkpoint/YAML compatibility while their public contract is
+# migrated to the canonical routing protocol.
+LEGACY_MOE_CLASSES = frozenset({
+    "A2C2fMoE",
+    "ABlockMoE",
+})
+
+_MOE_TIER_SETS = (STABLE_MOE_CLASSES, EXPERIMENTAL_MOE_CLASSES, LEGACY_MOE_CLASSES)
+_MOE_TIER_OVERLAP = set().union(*(
+    _MOE_TIER_SETS[i] & _MOE_TIER_SETS[j]
+    for i in range(len(_MOE_TIER_SETS))
+    for j in range(i + 1, len(_MOE_TIER_SETS))
+))
+if _MOE_TIER_OVERLAP:
+    raise RuntimeError(f"MoE API tier overlap detected: {_MOE_TIER_OVERLAP}")
+
 def is_stable_moe(class_name: str) -> bool:
     """Check if a MoE class is in the stable (production-ready) tier."""
     return class_name in STABLE_MOE_CLASSES
@@ -128,6 +152,11 @@ def is_stable_moe(class_name: str) -> bool:
 def is_experimental_moe(class_name: str) -> bool:
     """Check if a MoE class is experimental (API may change)."""
     return class_name in EXPERIMENTAL_MOE_CLASSES
+
+
+def is_legacy_moe(class_name: str) -> bool:
+    """Check if a MoE class is retained for compatibility only."""
+    return class_name in LEGACY_MOE_CLASSES
 
 
 __all__ = [
@@ -202,8 +231,16 @@ __all__ = [
     "MapSaturationSchedulerConfig",
     "MapSaturationScheduleState",
     "compute_gini",
+    "MIXTURE_DEFAULTS",
+    "CLI_FIELDS",
+    "ResolvedMixtureConfig",
+    "annotate_mixture_yaml_config",
+    "resolve_mixture_config",
+    "apply_mixture_config",
     "STABLE_MOE_CLASSES",
     "EXPERIMENTAL_MOE_CLASSES",
+    "LEGACY_MOE_CLASSES",
     "is_stable_moe",
     "is_experimental_moe",
+    "is_legacy_moe",
 ]

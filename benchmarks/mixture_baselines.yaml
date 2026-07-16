@@ -1,0 +1,7 @@
+schema_version: 1
+notes: Record hardware-specific measurements from benchmark_mot_dispatch.py and benchmark_molora_dispatch.py.
+gates:
+  eval_sparse_parity_max_abs: 1.0e-4
+  minimum_expert_flops_reduction: 0.20
+  minimum_measurements: 3
+baselines: []
