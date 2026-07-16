@@ -339,6 +339,13 @@ class Exporter:
         flags = [x == fmt for x in fmts]
         if sum(flags) != 1:
             raise ValueError(f"Invalid export format='{fmt}'. Valid formats are {fmts}")
+        from ultralytics.utils.export_preflight import export_preflight
+        preflight_report = export_preflight(model.model if hasattr(model, "model") else model, fmt, strict=True)
+        self.export_preflight_report = preflight_report
+        LOGGER.info(
+            f"Export preflight: format={fmt}, routed_modules={len(preflight_report['decisions'])}, "
+            f"strategies={sorted({item['strategy'] for item in preflight_report['decisions']})}"
+        )
         (
             jit,
             onnx,
