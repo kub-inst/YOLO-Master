@@ -20,6 +20,11 @@ from ._common import (
 import os
 import math
 import copy
+
+# Disabled by default: finite checks synchronize accelerators.  Enable only for
+# bounded failure localization, e.g. MOE_FINITE_DIAGNOSTICS=1.
+_MOE_FINITE_DIAGNOSTICS = os.environ.get("MOE_FINITE_DIAGNOSTICS", "0").lower() in {"1", "true", "yes", "on"}
+_MOE_FINITE_DIAGNOSTIC_MAX_EVENTS = max(int(os.environ.get("MOE_FINITE_DIAGNOSTIC_MAX_EVENTS", "1")), 1)
 import weakref
 import threading
 import torch
@@ -1037,12 +1042,35 @@ class ABlockMoE(ABlock):
             add_residual=False,  # ABlockMoE owns the MLP residual (see forward)
         )
 
+    def _check_finite(self, value: torch.Tensor, boundary: str) -> None:
+        """Fail at an opt-in residual boundary without changing activations."""
+        if not _MOE_FINITE_DIAGNOSTICS:
+            return
+        events = getattr(self, "_moe_nonfinite_events", 0)
+        if events >= _MOE_FINITE_DIAGNOSTIC_MAX_EVENTS:
+            return
+        if not bool(torch.isfinite(value).all().item()):
+            self._moe_nonfinite_events = events + 1
+            raise RuntimeError(
+                f"ABlockMoE non-finite tensor at {boundary} "
+                f"(shape={tuple(value.shape)}, dtype={value.dtype})"
+            )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Mirror ABlock semantics: residual around attn, then residual around mlp.
         # The inner MoE has add_residual=False, so the residual is applied here
-        # exactly once (no double-add).
-        x = x + self.attn(x)
-        return x + self.mlp(x)
+        # exactly once (no double-add). Diagnostics intentionally fail fast rather
+        # than sanitizing activations, preserving the original fault boundary.
+        self._check_finite(x, "input")
+        attn_out = self.attn(x)
+        self._check_finite(attn_out, "attention output")
+        x = x + attn_out
+        self._check_finite(x, "attention residual")
+        mlp_out = self.mlp(x)
+        self._check_finite(mlp_out, "MoE output")
+        output = x + mlp_out
+        self._check_finite(output, "MoE residual")
+        return output
 
     @property
     def aux_loss(self):

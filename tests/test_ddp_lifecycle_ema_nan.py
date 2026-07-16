@@ -107,6 +107,37 @@ def test_nonfinite_loss_recovers_from_healthy_checkpoint(tmp_path):
     t._load_checkpoint_state.assert_called_once()
 
 
+def test_recovery_clears_non_checkpoint_moe_registry(tmp_path):
+    from ultralytics.nn.modules.moe._common import MOE_LOSS_REGISTRY
+
+    t = recovery_trainer(tmp_path, loss=float("nan"))
+    module = nn.Linear(1, 1)
+    MOE_LOSS_REGISTRY[module] = torch.tensor(float("nan"))
+    write_healthy(t.healthy)
+    try:
+        assert t._handle_nan_recovery(0) is True
+        assert not list(MOE_LOSS_REGISTRY.items())
+    finally:
+        MOE_LOSS_REGISTRY.clear()
+
+
+def test_validate_skips_nonfinite_ema_and_marks_recovery():
+    t = object.__new__(BaseTrainer)
+    t.device = torch.device("cpu")
+    t.ema = SimpleNamespace(ema=nn.Linear(1, 1))
+    with torch.no_grad():
+        t.ema.ema.weight.fill_(float("nan"))
+    t._sync_ema_buffers_for_validation = MagicMock()
+    t.validator = MagicMock()
+
+    metrics, fitness = t.validate()
+
+    assert metrics == {}
+    assert fitness != fitness
+    assert t._ema_nonfinite is True
+    t.validator.assert_not_called()
+
+
 def test_gradient_recovery_preserves_reduced_scaler_state(tmp_path):
     t = recovery_trainer(tmp_path, loss=1.0)
     t._gradient_nonfinite = True

@@ -238,10 +238,12 @@ class BaseRouter(nn.Module):
         if training and noise_std > 0:
             logits = logits + torch.randn_like(logits) * noise_std
 
-        # 2) Compute probabilities
-        probs = F.softmax(logits.float(), dim=1).type_as(logits)
+        # 2) Keep routing probability math in fp32.  Under CUDA autocast the
+        # router logits can be fp16; retaining fp32 through Top-K normalization
+        # avoids quantized small probabilities and a low-precision reduction.
+        probs = F.softmax(logits.float(), dim=1)
 
-        # 3) Select Top-K
+        # 3) Select Top-K in fp32
         topk_vals, topk_indices = torch.topk(probs, effective_top_k, dim=1)
 
         # P1-5: Apply capacity factor constraint if configured
@@ -256,8 +258,9 @@ class BaseRouter(nn.Module):
                 # Overflow tokens are sent to the default expert (expert 0).
                 topk_indices = topk_indices.clone()
                 topk_indices[~overflow_mask] = 0
-                topk_vals = topk_vals.clone()
-                topk_vals[~overflow_mask] = 0
+                # Mask routing probabilities before normalization so the
+                # capacity decision cannot be undone by later weighting.
+                topk_vals = topk_vals.masked_fill(~overflow_mask[:, None], 0)
                 topk_vals[~overflow_mask, 0] = 1
 
         # 4) Normalize weights
@@ -301,7 +304,10 @@ class EfficientSpatialRouter(BaseRouter):
             x_in = x
 
         out = self.router(x_in)  # [B, E, H', W']
-        global_logits = torch.mean(out, dim=[2, 3])  # [B, E]
+        # Spatial reduction is sensitive to fp16 cancellation/underflow on
+        # large feature maps.  Promote only this routing statistic; convolution
+        # remains governed by the caller's autocast policy.
+        global_logits = out.float().mean(dim=[2, 3])  # [B, E]
 
         return self._process_logits(global_logits, self.noise_std, self.training, top_k=top_k)
 
@@ -501,23 +507,7 @@ class DynamicRoutingLayer(nn.Module):
         return weights.view(B, E, H, W)
 
     def _hard_top_k(self, logits):
-        """Hard Top-K during inference for true sparsity."""
-        B, E, H, W = logits.shape
-        logits_flat = logits.view(B, E, -1)
-
-        # Find Top-K
-        topk_values, topk_indices = torch.topk(logits_flat, self.top_k, dim=1)
-
-        # Apply softmax to Top-K logits
-        # Fix: Clamp values to avoid overflow before softmax
-        topk_values = topk_values.clamp(-30.0, 30.0)
-        topk_weights = F.softmax(topk_values.float(), dim=1).type_as(logits)
-
-        # Construct sparse weights
-        idx = topk_indices.permute(0, 2, 1).contiguous()
-        oh = F.one_hot(idx, num_classes=E)
-        tw = topk_weights.permute(0, 2, 1).contiguous()
-        weighted = (oh.to(tw.dtype) * tw.unsqueeze(-1)).sum(dim=2)
-        weights = weighted.permute(0, 2, 1).contiguous()
-
-        return weights.view(B, E, H, W)
+        """Inference Top-K with the same numerics as the differentiable path."""
+        # Both paths must rank and normalize the same clamped logits. The only
+        # inference-specific difference is that callers may skip zero-weight experts.
+        return self._soft_top_k(logits)

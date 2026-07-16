@@ -1508,6 +1508,14 @@ class BaseTrainer:
             pass
         return True
 
+    @staticmethod
+    def _reset_non_checkpoint_moe_runtime_state():
+        """Clear per-process MoE auxiliary state omitted from recovery checkpoints."""
+        from ultralytics.nn.modules.moe._common import MOE_LOSS_REGISTRY, _MOE_LOSS_REGISTRY_LOCK
+
+        with _MOE_LOSS_REGISTRY_LOCK:
+            MOE_LOSS_REGISTRY.clear()
+
     def _save_healthy_checkpoint(self, serialized_ckpt):
         """Atomically replace the recovery checkpoint only with a finite complete state.
 
@@ -2151,6 +2159,12 @@ class BaseTrainer:
                 return None, None  # skip validation — rank is likely dead
 
         self._sync_ema_buffers_for_validation()
+        ema_model = getattr(getattr(self, "ema", None), "ema", None)
+        if ema_model is not None and not self._state_is_finite(unwrap_model(ema_model)):
+            LOGGER.warning("Skipping validation because EMA state is non-finite.")
+            self._ema_nonfinite = True
+            return {}, float("nan")
+        self._ema_nonfinite = False
         try:
             metrics = self.validator(self)
         except Exception as e:
@@ -2360,8 +2374,9 @@ class BaseTrainer:
         loss_nonfinite = self.loss is not None and not bool(torch.isfinite(self.loss.detach()).all().item())
         fitness_nonfinite = self.fitness is not None and not bool(np.isfinite(self.fitness))
         gradient_nonfinite = bool(getattr(self, "_gradient_nonfinite", False))
+        ema_nonfinite = bool(getattr(self, "_ema_nonfinite", False))
         local_flags = torch.tensor(
-            [int(loss_nonfinite), int(fitness_nonfinite), int(gradient_nonfinite)], dtype=torch.int32,
+            [int(loss_nonfinite), int(fitness_nonfinite), int(gradient_nonfinite), int(ema_nonfinite)], dtype=torch.int32,
             device=self.device if RANK != -1 and dist.get_backend() == "nccl" else torch.device("cpu"),
         )
         if RANK != -1:
@@ -2369,7 +2384,11 @@ class BaseTrainer:
         flags = [bool(x) for x in local_flags.cpu().tolist()]
         if not any(flags):
             return False
-        reason = ", ".join(name for name, active in zip(("Loss NaN/Inf", "Fitness NaN/Inf", "Gradient NaN/Inf"), flags) if active)
+        reason = ", ".join(
+            name
+            for name, active in zip(("Loss NaN/Inf", "Fitness NaN/Inf", "Gradient NaN/Inf", "EMA NaN/Inf"), flags)
+            if active
+        )
         diagnostic = getattr(self, "_nonfinite_diagnostic", None)
         if diagnostic is not None:
             LOGGER.warning(f"[NaN diagnostic] first local event before recovery: {diagnostic}")
@@ -2414,9 +2433,11 @@ class BaseTrainer:
             if missing:
                 LOGGER.warning(f"[NaN recovery] EMA state_dict missing keys (non-fatal): {missing}")
         self._load_checkpoint_state(ckpt)
+        self._reset_non_checkpoint_moe_runtime_state()
         if recovery_scaler_state is not None:
             self.scaler.load_state_dict(recovery_scaler_state)
         self._gradient_nonfinite = False
+        self._ema_nonfinite = False
         self._nonfinite_diagnostic = None
         del ckpt, ema_state
         self.scheduler.last_epoch = epoch - 1

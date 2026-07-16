@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from ultralytics.nn.modules.moe import base as moe_base
 from ultralytics.nn.modules.moe.routers import (
     UltraEfficientRouter,
     EfficientSpatialRouter,
@@ -207,3 +208,58 @@ class TestExceptionHierarchy:
         router = UltraEfficientRouter(IN_CHANNELS, NUM_EXPERTS)
         with pytest.raises(YOLOMasterError):
             router(x)
+
+
+# =============================================================================
+# FP16 routing precision regressions
+# =============================================================================
+
+class TestABlockMoEDiagnostics:
+    def test_diagnostics_fail_at_first_nonfinite_boundary(self, monkeypatch):
+        block = object.__new__(moe_base.ABlockMoE)
+        nn.Module.__init__(block)
+        block.attn = nn.Identity()
+        block.mlp = nn.Identity()
+        monkeypatch.setattr(moe_base, "_MOE_FINITE_DIAGNOSTICS", True)
+        monkeypatch.setattr(moe_base, "_MOE_FINITE_DIAGNOSTIC_MAX_EVENTS", 1)
+
+        x = torch.ones(1, 1, 1, 1)
+        block.attn = nn.Sequential(nn.Identity())
+        block.attn.forward = lambda _: torch.full_like(x, float("nan"))
+        with pytest.raises(RuntimeError, match="attention output"):
+            block(x)
+
+    def test_diagnostics_are_disabled_by_default(self, monkeypatch):
+        block = object.__new__(moe_base.ABlockMoE)
+        nn.Module.__init__(block)
+        block.attn = nn.Identity()
+        block.mlp = nn.Identity()
+        monkeypatch.setattr(moe_base, "_MOE_FINITE_DIAGNOSTICS", False)
+
+        output = block(torch.ones(1, 1, 1, 1))
+        assert torch.isfinite(output).all()
+
+
+class TestEfficientSpatialRouterPrecision:
+    def test_half_spatial_reduction_and_weights_stay_fp32(self):
+        """Routing statistics and normalized Top-K weights avoid fp16 reductions."""
+        torch.manual_seed(0)
+        router = EfficientSpatialRouter(IN_CHANNELS, NUM_EXPERTS, top_k=TOP_K).eval().half()
+        x = torch.randn(2, IN_CHANNELS, 32, 32, dtype=torch.float16)
+        weights, indices, _ = router(x)
+
+        assert weights.dtype == torch.float32
+        assert indices.dtype == torch.long
+        assert torch.isfinite(weights).all()
+        assert torch.allclose(weights.sum(dim=1), torch.ones(2), atol=1e-6)
+
+    def test_process_logits_normalizes_extreme_half_logits_in_fp32(self):
+        """Small selected probabilities retain precision after fp16-router output."""
+        router = EfficientSpatialRouter(IN_CHANNELS, NUM_EXPERTS, top_k=TOP_K).eval()
+        logits = torch.tensor([[12.0, 0.0, -12.0, -24.0]], dtype=torch.float16)
+        weights, indices, _ = router._process_logits(logits, noise_std=0.0, training=False)
+
+        assert weights.dtype == torch.float32
+        assert torch.isfinite(weights).all()
+        assert torch.allclose(weights.sum(dim=1), torch.ones(1), atol=1e-6)
+        assert indices.dtype == torch.long
