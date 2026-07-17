@@ -96,6 +96,52 @@ wrapper.merge()
 wrapper.unmerge()
 ```
 
+MoLoRA 支持三种 merge 模式：
+
+| 模式 | 用途 | 说明 |
+|------|------|------|
+| `uniform` | 兼容旧行为 | 所有专家按 `1/E` 均匀合并 |
+| `ema` | 默认部署路径 | 使用训练期间实际 top-k 稀疏贡献的 EMA |
+| `calibrated` | 推荐发布路径 | 在代表性校准数据上为每个 MoLoRA 层独立统计路由权重 |
+
+使用少量代表性数据进行校准合并：
+
+```python
+calibration_batches = [torch.randn(8, 3, 640, 640) for _ in range(10)]
+summary = wrapper.merge(
+    mode="calibrated",
+    calibration_data=calibration_batches,
+    max_batches=10,
+)
+print(summary["batches"])
+```
+
+YOLO dataloader 通常返回包含 `img` 的字典，可通过 `forward_fn` 指定模型输入：
+
+```python
+wrapper.merge(
+    mode="calibrated",
+    calibration_data=dataloader,
+    max_batches=100,
+    forward_fn=lambda model, batch: model(batch["img"]),
+)
+```
+
+也可以直接传入一组权重，或按层名传入不同权重：
+
+```python
+wrapper.merge(mode="calibrated", calibration=[0.5, 0.3, 0.15, 0.05])
+wrapper.merge(
+    mode="calibrated",
+    calibration={
+        "model.5.conv": [0.7, 0.2, 0.1, 0.0],
+        "model.8.conv": [0.1, 0.2, 0.3, 0.4],
+    },
+)
+```
+
+校准过程使用 `eval()` 与 `torch.no_grad()`，结束后恢复原有训练/评估状态。三种模式都是对动态路由的静态近似，merge metadata 会记录所用模式、专家权重和校准批次数。
+
 ## 5. 持续学习：多域顺序训练
 
 ### 5.1 域分配

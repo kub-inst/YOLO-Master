@@ -268,6 +268,34 @@ class TestMoLoRALayer:
         out = layer(x)
         assert out.shape == (2, 32, 8, 8)
 
+    def test_merge_weights_defaults_to_routing_usage_ema(self):
+        layer = MoLoRALayer(nn.Linear(2, 2, bias=False), r=1, alpha=1, num_experts=2, top_k=1, use_rslora=False)
+        with torch.no_grad():
+            layer.base_layer.weight.zero_()
+            layer.experts[0].lora_A.weight.fill_(1.0)
+            layer.experts[0].lora_B.weight.fill_(1.0)
+            layer.experts[1].lora_A.weight.fill_(1.0)
+            layer.experts[1].lora_B.weight.fill_(3.0)
+            layer._usage_ema.copy_(torch.tensor([0.75, 0.25]))
+
+        layer.merge_weights()
+
+        assert layer._merge_metadata["mode"] == "ema"
+        assert layer._merge_metadata["expert_weights"] == pytest.approx([0.75, 0.25])
+        assert torch.allclose(layer.base_layer.weight, torch.full_like(layer.base_layer.weight, 1.5))
+
+    def test_training_updates_routing_usage_ema(self):
+        layer = MoLoRALayer(nn.Linear(4, 4), r=2, alpha=4, num_experts=2, top_k=1)
+        initial = layer._usage_ema.clone()
+        layer.train()
+        with torch.no_grad():
+            layer.router.fc[-1].bias.copy_(torch.tensor([2.0, -2.0]))
+
+        layer(torch.randn(8, 4))
+
+        assert not torch.equal(layer._usage_ema, initial)
+        assert torch.isclose(layer._usage_ema.sum(), torch.tensor(1.0))
+
     def test_unmerge_weights(self):
         conv = nn.Conv2d(16, 32, 3, padding=1)
         layer = MoLoRALayer(conv, r=4, alpha=8, num_experts=4, top_k=2)
@@ -505,6 +533,32 @@ class TestMoLoRAModelWrapper:
             torch.save(state, path)
             with pytest.raises(RuntimeError, match="state mismatch"):
                 wrapper.load_checkpoint(path)
+        finally:
+            os.unlink(path)
+
+    def test_checkpoint_without_usage_ema_loads_with_uniform_fallback(self):
+        model = self._make_model()
+        cfg = MoLoRAConfig(
+            r=4, alpha=8, num_experts=4, top_k=2,
+            target_modules=["conv1", "conv2", "fc"]
+        )
+        wrapper = MoLoRAModel(model, cfg)
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            path = f.name
+        try:
+            wrapper.save_checkpoint(path)
+            state = torch.load(path, map_location="cpu")
+            state["state_dict"] = {
+                key: value for key, value in state["state_dict"].items() if not key.endswith("._usage_ema")
+            }
+            torch.save(state, path)
+
+            restored = MoLoRAModel(self._make_model(), cfg)
+            restored.load_checkpoint(path)
+
+            for module in restored.model.modules():
+                if isinstance(module, MoLoRALayer):
+                    assert torch.allclose(module._usage_ema, torch.full_like(module._usage_ema, 0.25))
         finally:
             os.unlink(path)
 

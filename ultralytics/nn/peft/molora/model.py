@@ -5,7 +5,7 @@ Provides:
   - MoLoRAModel: convenience wrapper with aux_loss, merge/unmerge, checkpointing
 """
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -44,7 +44,7 @@ def get_peft_molora_model(
         # Common peft adapter classes to detect
         for cls_name in ("LoraLayer", "AdaLoRALayer", "IA3Layer", "AdaloraLayer"):
             try:
-                mod, attr = __import__("peft.tuners", fromlist=[cls_name]), None
+                mod = __import__("peft.tuners", fromlist=[cls_name])
                 for part in cls_name.split("."):
                     mod = getattr(mod, part)
                 _peft_classes = _peft_classes + (mod,)
@@ -166,6 +166,118 @@ def _get_submodule(model: nn.Module, path: str) -> Optional[nn.Module]:
     return mod
 
 
+def _move_calibration_batch(batch: Any, device: torch.device) -> Any:
+    """Move nested calibration tensors to the model device without changing container types."""
+    if isinstance(batch, torch.Tensor):
+        return batch.to(device)
+    if isinstance(batch, Mapping):
+        return type(batch)((key, _move_calibration_batch(value, device)) for key, value in batch.items())
+    if isinstance(batch, tuple):
+        return tuple(_move_calibration_batch(value, device) for value in batch)
+    if isinstance(batch, list):
+        return [_move_calibration_batch(value, device) for value in batch]
+    return batch
+
+
+def _run_calibration_forward(
+    model: nn.Module,
+    batch: Any,
+    forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+) -> Any:
+    """Run one calibration batch using common PyTorch batch conventions."""
+    if forward_fn is not None:
+        return forward_fn(model, batch)
+    if isinstance(batch, torch.Tensor):
+        return model(batch)
+    if isinstance(batch, Mapping):
+        return model(**batch)
+    if isinstance(batch, (tuple, list)):
+        return model(*batch)
+    raise TypeError(
+        "Unsupported calibration batch type. Provide a Tensor, tuple/list, mapping, or forward_fn(model, batch)."
+    )
+
+
+def calibrate_molora_merge_weights(
+    model: nn.Module,
+    calibration_data: Iterable[Any],
+    *,
+    max_batches: Optional[int] = None,
+    forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+) -> Dict[str, Any]:
+    """Collect layer-specific sparse routing weights from calibration forwards."""
+    if calibration_data is None:
+        raise ValueError("calibration_data is required for calibrated MoLoRA merge")
+    if max_batches is not None and max_batches <= 0:
+        raise ValueError("max_batches must be positive when provided")
+
+    layers = {name: module for name, module in model.named_modules() if isinstance(module, MoLoRALayer)}
+    if not layers:
+        raise ValueError("No MoLoRALayer modules found for calibration")
+    merged = [name for name, layer in layers.items() if layer.merged]
+    if merged:
+        raise RuntimeError(f"Cannot calibrate already merged MoLoRA layers: {', '.join(merged)}")
+
+    modules = list(model.modules())
+    training_states = [module.training for module in modules]
+    device = next(model.parameters()).device
+    batches = 0
+    for layer in layers.values():
+        layer.start_merge_calibration()
+
+    try:
+        model.eval()
+        with torch.no_grad():
+            for batch in calibration_data:
+                if max_batches is not None and batches >= max_batches:
+                    break
+                batch = _move_calibration_batch(batch, device)
+                _run_calibration_forward(model, batch, forward_fn)
+                batches += 1
+        if batches == 0:
+            raise ValueError("calibration_data produced no batches")
+
+        weights = {}
+        observed_batches = {}
+        for name, layer in layers.items():
+            layer_weights, layer_batches = layer.finish_merge_calibration()
+            weights[name] = layer_weights
+            observed_batches[name] = layer_batches
+        return {"batches": batches, "weights": weights, "observed_batches": observed_batches}
+    finally:
+        for layer in layers.values():
+            layer.cancel_merge_calibration()
+        for module, training in zip(modules, training_states):
+            module.training = training
+
+
+def _explicit_calibration_weights(
+    calibration: Optional[Union[List[float], Mapping[str, List[float]]]],
+    layer_name: str,
+) -> Optional[List[float]]:
+    """Resolve shared or per-layer explicit calibration weights."""
+    if calibration is None:
+        return None
+    if isinstance(calibration, Mapping):
+        weights = calibration.get(layer_name)
+        if weights is None:
+            raise ValueError(f"Missing explicit calibration weights for MoLoRA layer {layer_name!r}")
+        return list(weights)
+    return list(calibration)
+
+
+def _validate_calibration_weights(weights: List[float], num_experts: int, layer_name: str) -> List[float]:
+    """Validate and normalize a calibration vector before any layer is mutated."""
+    tensor = torch.as_tensor(weights, dtype=torch.float32)
+    if tensor.ndim != 1 or tensor.numel() != num_experts:
+        raise ValueError(f"Calibration for MoLoRA layer {layer_name!r} must provide {num_experts} weights")
+    if not torch.isfinite(tensor).all() or (tensor < 0).any() or float(tensor.sum()) <= 0:
+        raise ValueError(
+            f"Calibration for MoLoRA layer {layer_name!r} must be finite, non-negative, and non-zero"
+        )
+    return (tensor / tensor.sum()).tolist()
+
+
 # ---------------------------------------------------------------------------
 # Wrapper class (optional convenience)
 # ---------------------------------------------------------------------------
@@ -214,12 +326,52 @@ class MoLoRAModel(nn.Module):
                     aux_loss = aux_loss + loss_t.to(device)
         return aux_loss
 
-    def merge(self) -> None:
-        """Merge all MoLoRALayer weights for inference."""
-        for m in self.model.modules():
-            if isinstance(m, MoLoRALayer):
-                m.merge_weights()
+    def merge(
+        self,
+        mode: str = "ema",
+        *,
+        calibration_data: Optional[Iterable[Any]] = None,
+        calibration: Optional[Union[List[float], Mapping[str, List[float]]]] = None,
+        max_batches: Optional[int] = None,
+        forward_fn: Optional[Callable[[nn.Module, Any], Any]] = None,
+    ) -> Dict[str, Any]:
+        """Merge all MoLoRA layers using uniform, EMA, or calibration-data weights."""
+        if mode not in {"ema", "uniform", "calibrated"}:
+            raise ValueError("MoLoRA merge mode must be 'ema', 'uniform', or 'calibrated'")
+
+        layers = {name: module for name, module in self.model.named_modules() if isinstance(module, MoLoRALayer)}
+        result: Dict[str, Any] = {"batches": 0, "weights": {}}
+        if mode == "calibrated":
+            if calibration is None and calibration_data is None:
+                raise ValueError("calibrated merge requires calibration_data or explicit calibration weights")
+            if calibration_data is not None:
+                result = calibrate_molora_merge_weights(
+                    self.model,
+                    calibration_data,
+                    max_batches=max_batches,
+                    forward_fn=forward_fn,
+                )
+
+        resolved_weights = {}
+        if mode == "calibrated":
+            for name, layer in layers.items():
+                weights = result.get("weights", {}).get(name)
+                if weights is None:
+                    weights = _explicit_calibration_weights(calibration, name)
+                resolved_weights[name] = _validate_calibration_weights(weights, layer.num_experts, name)
+
+        for name, layer in layers.items():
+            weights = resolved_weights.get(name)
+            metadata = None
+            if mode == "calibrated":
+                observed = result.get("observed_batches", {}).get(name, 0)
+                metadata = {
+                    "calibration_batches": observed,
+                    "calibration_source": "data" if calibration_data is not None else "explicit",
+                }
+            layer.merge_weights(mode=mode, calibration=weights, calibration_metadata=metadata)
         LOGGER.info("[MoLoRA] All layers merged.")
+        return result
 
     def unmerge(self) -> None:
         """Unmerge all MoLoRALayer weights."""
@@ -362,6 +514,15 @@ class MoLoRAModel(nn.Module):
         if not isinstance(checkpoint_sd, dict):
             raise ValueError("Invalid MoLoRA checkpoint: 'state_dict' must be a dictionary.")
         expected_keys = {k for k in self.model.state_dict() if _is_molora_state_key(k)}
+        missing_usage_ema = sorted(k for k in expected_keys - set(checkpoint_sd) if k.endswith("._usage_ema"))
+        if missing_usage_ema:
+            current_state = self.model.state_dict()
+            checkpoint_sd = dict(checkpoint_sd)
+            checkpoint_sd.update({key: current_state[key] for key in missing_usage_ema})
+            LOGGER.warning(
+                f"[MoLoRA] Checkpoint predates routing usage EMA; initialized {len(missing_usage_ema)} "
+                "layer buffer(s) with uniform expert weights."
+            )
         missing = sorted(expected_keys - set(checkpoint_sd))
         unexpected = sorted(set(checkpoint_sd) - expected_keys)
         if missing or unexpected:

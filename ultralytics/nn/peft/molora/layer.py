@@ -5,7 +5,7 @@ Contains:
   - MoLoRALayer: a wrapper that replaces a base layer with top-k sparse experts
 """
 import math
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -161,6 +161,10 @@ class MoLoRALayer(nn.Module):
         self.warmup_steps = warmup_steps
         self.domain_experts = domain_experts
         self.register_buffer("_step_count", torch.tensor(0, dtype=torch.long), persistent=True)
+        self.register_buffer(
+            "_usage_ema", torch.full((num_experts,), 1.0 / num_experts, dtype=torch.float32), persistent=True
+        )
+        self.usage_ema_decay = 0.99
         # Active mask for domain pre-allocation
         self._domain_active_mask: Optional[torch.Tensor] = None
         # Expert frozen mask
@@ -213,6 +217,8 @@ class MoLoRALayer(nn.Module):
         self.last_routing_snapshot: dict = {}
         self._last_dispatch_stats: dict = {}
         self._merge_metadata: dict = {"mode": "dynamic", "approximate": True, "expert_weights": []}
+        self._merge_calibration_usage: Optional[torch.Tensor] = None
+        self._merge_calibration_batches = 0
 
     def publish_aux_loss(self, *, step: int, training: bool) -> torch.Tensor:
         return publish_aux_loss(self, getattr(self, "_last_aux_loss", torch.zeros(())), step=step, kind="molora", training=training)
@@ -356,6 +362,67 @@ class MoLoRALayer(nn.Module):
         self._domain_active_mask = None
 
     # ------------------------------------------------------------------
+    # Routing-aware merge statistics
+    # ------------------------------------------------------------------
+
+    def _routing_contribution(
+        self,
+        top_k_weights: torch.Tensor,
+        top_k_indices: torch.Tensor,
+        *,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """Return weighted expert usage from the final sparse routing decision."""
+        contribution = torch.zeros(self.num_experts, device=top_k_weights.device, dtype=torch.float32)
+        contribution.scatter_add_(
+            0,
+            top_k_indices.reshape(-1).long(),
+            top_k_weights.detach().float().reshape(-1),
+        )
+        if normalize:
+            contribution = contribution / contribution.sum().clamp_min(1e-12)
+        return contribution
+
+    def _record_routing_contribution(
+        self,
+        top_k_weights: torch.Tensor,
+        top_k_indices: torch.Tensor,
+    ) -> None:
+        """Update training EMA and any active calibration accumulator."""
+        contribution = self._routing_contribution(top_k_weights, top_k_indices, normalize=False)
+        normalized = contribution / contribution.sum().clamp_min(1e-12)
+        if self.training:
+            with torch.no_grad():
+                self._usage_ema.mul_(self.usage_ema_decay).add_(
+                    normalized.to(self._usage_ema.device), alpha=1.0 - self.usage_ema_decay
+                )
+        if self._merge_calibration_usage is not None:
+            self._merge_calibration_usage.add_(contribution.to(self._merge_calibration_usage.device))
+            self._merge_calibration_batches += 1
+
+    def start_merge_calibration(self) -> None:
+        """Start an ephemeral routing-usage accumulator for calibrated merge."""
+        if self.merged:
+            raise RuntimeError("Cannot calibrate an already merged MoLoRA layer")
+        self._merge_calibration_usage = torch.zeros_like(self._usage_ema, dtype=torch.float32)
+        self._merge_calibration_batches = 0
+
+    def finish_merge_calibration(self) -> tuple[list[float], int]:
+        """Return normalized calibration weights and clear the accumulator."""
+        usage = self._merge_calibration_usage
+        batches = self._merge_calibration_batches
+        self.cancel_merge_calibration()
+        if usage is None or batches <= 0 or not torch.isfinite(usage).all() or float(usage.sum()) <= 0:
+            raise RuntimeError("MoLoRA layer received no valid routing observations during calibration")
+        weights = usage.clamp_min(0) / usage.clamp_min(0).sum()
+        return weights.detach().cpu().tolist(), batches
+
+    def cancel_merge_calibration(self) -> None:
+        """Discard an in-progress calibration accumulator."""
+        self._merge_calibration_usage = None
+        self._merge_calibration_batches = 0
+
+    # ------------------------------------------------------------------
     # Expert freezing (continual learning)
     # ------------------------------------------------------------------
 
@@ -427,6 +494,8 @@ class MoLoRALayer(nn.Module):
         # Apply capacity limit (1.0 = no limit per config convention)
         if 0 < self.capacity_factor < 1.0:
             top_k_weights = self._apply_capacity_limit(top_k_weights, top_k_indices)
+
+        self._record_routing_contribution(top_k_weights, top_k_indices)
 
         # Compute sparse expert outputs
         adapted = self._compute_sparse_experts(x, top_k_weights, top_k_indices, base_out)
@@ -525,17 +594,28 @@ class MoLoRALayer(nn.Module):
     # Merge / Unmerge
     # ------------------------------------------------------------------
 
-    def merge_weights(self, mode: str = "uniform", calibration: Optional[List[float]] = None) -> None:
+    def merge_weights(
+        self,
+        mode: str = "ema",
+        calibration: Optional[List[float]] = None,
+        calibration_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Merge all expert deltas into the base layer weight.
 
         After merge, forward skips the LoRA path.  This is useful for
         ONNX export / inference where you want zero adapter overhead.
         """
-        if mode not in {"uniform", "calibrated"}:
-            raise ValueError("MoLoRA merge mode must be 'uniform' or 'calibrated'")
+        if mode not in {"ema", "uniform", "calibrated"}:
+            raise ValueError("MoLoRA merge mode must be 'ema', 'uniform', or 'calibrated'")
         if self.merged:
             return
-        if mode == "calibrated":
+        if mode == "ema":
+            weights = self._usage_ema.detach().float().cpu()
+            if not torch.isfinite(weights).all() or float(weights.sum()) <= 0:
+                weights = torch.full((self.num_experts,), 1.0 / self.num_experts)
+            else:
+                weights = weights.clamp_min(0) / weights.clamp_min(0).sum()
+        elif mode == "calibrated":
             if calibration is None or len(calibration) != self.num_experts:
                 raise ValueError("calibration must provide one weight per expert")
             weights = torch.as_tensor(calibration, dtype=torch.float32)
@@ -554,6 +634,8 @@ class MoLoRALayer(nn.Module):
 
         self.merged = True
         self._merge_metadata = {"mode": mode, "approximate": True, "expert_weights": weights.tolist()}
+        if calibration_metadata:
+            self._merge_metadata.update(calibration_metadata)
         LOGGER.debug(f"[MoLoRA] Merged {self.num_experts} experts into base layer.")
 
     def unmerge_weights(self) -> None:
