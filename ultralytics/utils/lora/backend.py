@@ -124,12 +124,60 @@ class MoLoRABackend:
         raise ValueError("MoLoRA backend load requires a MoLoRAModel wrapper for structural validation")
 
     def merge(self, model: nn.Module, **kwargs: Any) -> bool:
-        mode = kwargs.get("mode", "uniform")
-        if mode not in {"uniform", "calibrated"}:
-            raise ValueError("MoLoRA merge mode must be 'uniform' or 'calibrated'")
-        for module in _unwrap(model).modules():
-            if module.__class__.__name__ == "MoLoRALayer":
-                module.merge_weights(mode=mode, calibration=kwargs.get("calibration"))
+        mode = kwargs.get("mode", "ema")
+        if mode not in {"ema", "uniform", "calibrated"}:
+            raise ValueError("MoLoRA merge mode must be 'ema', 'uniform', or 'calibrated'")
+        model = _unwrap(model)
+        from ultralytics.nn.peft.molora.layer import MoLoRALayer
+        from ultralytics.nn.peft.molora.model import (
+            MoLoRAModel,
+            _explicit_calibration_weights,
+            _validate_calibration_weights,
+            calibrate_molora_merge_weights,
+        )
+
+        if isinstance(model, MoLoRAModel):
+            model.merge(
+                mode=mode,
+                calibration_data=kwargs.get("calibration_data"),
+                calibration=kwargs.get("calibration"),
+                max_batches=kwargs.get("max_batches"),
+                forward_fn=kwargs.get("forward_fn"),
+            )
+            return True
+
+        calibration = kwargs.get("calibration")
+        calibration_result = {"weights": {}, "observed_batches": {}}
+        if mode == "calibrated":
+            calibration_data = kwargs.get("calibration_data")
+            if calibration_data is not None:
+                calibration_result = calibrate_molora_merge_weights(
+                    model,
+                    calibration_data,
+                    max_batches=kwargs.get("max_batches"),
+                    forward_fn=kwargs.get("forward_fn"),
+                )
+            elif calibration is None:
+                raise ValueError("calibrated merge requires calibration_data or explicit calibration weights")
+
+        layers = {name: module for name, module in model.named_modules() if isinstance(module, MoLoRALayer)}
+        resolved_weights = {}
+        if mode == "calibrated":
+            for name, module in layers.items():
+                weights = calibration_result["weights"].get(name)
+                if weights is None:
+                    weights = _explicit_calibration_weights(calibration, name)
+                resolved_weights[name] = _validate_calibration_weights(weights, module.num_experts, name)
+
+        for name, module in layers.items():
+            weights = resolved_weights.get(name)
+            metadata = None
+            if mode == "calibrated":
+                metadata = {
+                    "calibration_batches": calibration_result["observed_batches"].get(name, 0),
+                    "calibration_source": "data" if kwargs.get("calibration_data") is not None else "explicit",
+                }
+            module.merge_weights(mode=mode, calibration=weights, calibration_metadata=metadata)
         return True
 
     def metadata(self, model: nn.Module) -> dict[str, Any]:

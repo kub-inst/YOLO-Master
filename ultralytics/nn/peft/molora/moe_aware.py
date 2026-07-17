@@ -12,14 +12,13 @@ Reference: AAAI 2026 MoE-aware PEFT strategy (Sec. 3.7 extension).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ultralytics.utils import LOGGER
 from .config import MoLoRAConfig
 from .layer import MoLoRALayer, MoLoRAExpert
 from .router import build_router
@@ -294,7 +293,10 @@ class MoLoRAMoEAwareLayer(MoLoRALayer):
         self.register_buffer(
             "_usage_ema", torch.full((num_experts,), 1.0 / num_experts), persistent=True
         )
-        self._usage_ema_momentum = 0.99
+        self.usage_ema_decay = 0.99
+        self._merge_calibration_usage: Optional[torch.Tensor] = None
+        self._merge_calibration_batches = 0
+        self._merge_metadata: dict = {"mode": "dynamic", "approximate": True, "expert_weights": []}
 
         # MoE-aware additions
         self.router_calibration = router_calibration
@@ -398,6 +400,8 @@ class MoLoRAMoEAwareLayer(MoLoRALayer):
 
         if 0 < self.capacity_factor < 1.0:
             top_k_weights = self._apply_capacity_limit(top_k_weights, top_k_indices)
+
+        self._record_routing_contribution(top_k_weights, top_k_indices)
 
         adapted = self._compute_sparse_experts(x, top_k_weights, top_k_indices, base_out)
 

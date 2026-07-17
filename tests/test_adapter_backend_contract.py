@@ -4,7 +4,13 @@ import torch
 import torch.nn as nn
 
 from ultralytics.nn.peft.molora import MoLoRAConfig, MoLoRAModel
-from ultralytics.utils.lora import adapter_metadata, discover_adapter_backend, load_adapters, save_adapters
+from ultralytics.utils.lora import (
+    adapter_metadata,
+    discover_adapter_backend,
+    load_adapters,
+    merge_adapters,
+    save_adapters,
+)
 
 
 def _model():
@@ -34,6 +40,13 @@ def test_molora_metadata_declares_dynamic_non_exact_merge():
     assert metadata["backend"] == "molora"
     assert metadata["exact_merge"] is False
     assert metadata["merge_mode"] == "dynamic"
+
+
+def test_molora_backend_defaults_to_ema_merge():
+    model = _model()
+    assert merge_adapters(model)
+    records = adapter_metadata(model)["merge_records"]
+    assert records and all(record["mode"] == "ema" for record in records)
 
 
 def test_molora_checkpoint_round_trip_via_backend(tmp_path):
