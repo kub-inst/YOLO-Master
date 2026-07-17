@@ -9,12 +9,8 @@ Covers features added in the optimization pass:
 """
 
 import json
-import tempfile
-import weakref
-from pathlib import Path
 
 import pytest
-import torch
 import torch.nn as nn
 from torch.nn.parallel import DataParallel
 
@@ -342,3 +338,54 @@ class TestPlannerAuditIntegration:
         assert data["decision_status"] == "ADAPT"
         assert data["recommended_variant"] == "lora"  # DoRA degraded to LoRA
 
+
+class TestPlannerCalibrationGates:
+    """Regression decisions expose calibration evidence and fail conservatively."""
+
+    @staticmethod
+    def _history(n=10):
+        variants = ("lora", "dora", "loha", "lokr", "ia3", "hra")
+        return [
+            (
+                ArchitectureFingerprint(phi_attn=(i % 3) * 0.15, phi_text=0.0, phi_dw=(i % 2) * 0.1),
+                variants[i % len(variants)],
+                0.05 + (i % 4) * 0.002,
+            )
+            for i in range(n)
+        ]
+
+    def test_fit_records_sample_size_and_effective_rank(self):
+        planner = PEFTPlanner()
+        planner.fit(self._history())
+
+        metadata = planner._calibration_metadata()
+        assert metadata["calibration_fitted"] is True
+        assert metadata["calibration_n_samples"] == 10
+        assert 0 < metadata["calibration_effective_rank"] <= metadata["calibration_n_features"]
+        assert metadata["low_confidence"] is True
+
+    def test_small_fitted_dataset_downgrades_accept_to_adapt(self):
+        from ultralytics.utils.lora.config import LoRAConfig
+
+        model = nn.Sequential(nn.Conv2d(3, 16, 3), nn.ReLU())
+        planner = PEFTPlanner()
+        planner.fit(self._history())
+        decision = planner.plan(model, LoRAConfig(peft_type="lora", r=8))
+
+        assert decision.status == "ADAPT"
+        assert decision.safety_overrides["planner_low_confidence"] is True
+        assert decision.metadata["calibration_n_samples"] == 10
+        assert decision.metadata["low_confidence"] is True
+
+    def test_uncertainty_lower_bound_can_refuse(self, monkeypatch):
+        from ultralytics.utils.lora.config import LoRAConfig
+
+        model = nn.Sequential(nn.Conv2d(3, 16, 3), nn.ReLU())
+        planner = PEFTPlanner()
+        planner.fit(self._history(30))
+        monkeypatch.setattr(planner, "predict_with_uncertainty", lambda *args, **kwargs: (0.01, 0.04))
+        decision = planner.plan(model, LoRAConfig(peft_type="lora", r=8))
+
+        assert decision.status == "REFUSE"
+        assert decision.safety_overrides["uncertainty_guard"] is True
+        assert decision.metadata["prediction_lower_95"] < planner.REFUSE_THRESHOLD
