@@ -284,6 +284,7 @@ class BaseTrainer:
             self.csv.unlink()
         self.plot_idx = [0, 1, 2]
         self.nan_recovery_attempts = 0
+        self._loss_nonfinite = False
         self._gradient_nonfinite = False
         self._nonfinite_diagnostic = None
 
@@ -1042,20 +1043,19 @@ class BaseTrainer:
                         self.loss *= self.world_size
                     self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
 
-                loss_finite = bool(torch.isfinite(self.loss.detach()).all().item())
-                if not loss_finite:
+                loss_nonfinite = not bool(torch.isfinite(self.loss.detach()).all().item())
+                if loss_nonfinite:
                     self._record_nonfinite_diagnostic("loss", epoch=epoch, step=ni, loss_items=self.loss_items)
-                    sync_context.__exit__(None, None, None)
-                    # DDP-wide skip: ensure all ranks agree to skip forward together.
-                    # Without this, different ranks process different batches → DDP desync → NCCL corruption.
-                    if RANK != -1 and dist.is_initialized():
-                        _skip_flag = torch.tensor(1, dtype=torch.int32, device=self.device)
-                        dist.all_reduce(_skip_flag, op=dist.ReduceOp.MAX)
-                        if _skip_flag.item() == 0:
-                            # Not all ranks saw NaN — don't skip; let training continue.
-                            # This prevents partial desync that corrupts NCCL state.
-                            pass
-                    continue
+                global_loss_nonfinite = self._sync_nonfinite_flag(loss_nonfinite)
+                if global_loss_nonfinite:
+                    self._loss_nonfinite = True
+                    try:
+                        recovery_loss = torch.nan_to_num(self.loss, nan=0.0, posinf=0.0, neginf=0.0) * 0.0
+                        self.scaler.scale(recovery_loss).backward()
+                    finally:
+                        sync_context.__exit__(None, None, None)
+                    self.optimizer.zero_grad()
+                    break
 
                 # Backward. Always unwind no_sync if forward/backward raises.
                 try:
@@ -1128,9 +1128,9 @@ class BaseTrainer:
 
             # Reject the partial epoch at the first detected gradient overflow. Recovery
             # owns the retry and must happen before any accepted-epoch side effects.
-            if self._gradient_nonfinite:
+            if self._loss_nonfinite or self._gradient_nonfinite:
                 if not self._handle_nan_recovery(epoch):
-                    raise RuntimeError("Gradient NaN/Inf was detected but recovery was not triggered.")
+                    raise RuntimeError("Loss or gradient NaN/Inf was detected but recovery was not triggered.")
                 continue
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
@@ -1663,6 +1663,15 @@ class BaseTrainer:
         }
         LOGGER.warning(f"[NaN diagnostic] {self._nonfinite_diagnostic}")
 
+    def _sync_nonfinite_flag(self, local_nonfinite):
+        """Return a DDP-wide nonfinite decision so every rank follows the same control flow."""
+        if RANK == -1 or not dist.is_initialized():
+            return bool(local_nonfinite)
+        device = self.device if dist.get_backend() == "nccl" else torch.device("cpu")
+        flag = torch.tensor(int(local_nonfinite), dtype=torch.int32, device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return bool(flag.item())
+
     def optimizer_step(self):
         """Perform one optimizer step and return whether it committed finite gradients."""
         self.scaler.unscale_(self.optimizer)  # unscale gradients
@@ -1671,22 +1680,18 @@ class BaseTrainer:
              if p.grad is not None and not bool(torch.isfinite(p.grad).all().item())),
             None,
         )
-        self._gradient_nonfinite = getattr(self, "_gradient_nonfinite", False) or bad_parameter is not None
-        if self._gradient_nonfinite:
+        local_gradient_nonfinite = bad_parameter is not None
+        if local_gradient_nonfinite:
             self._record_nonfinite_diagnostic(
                 "gradient", epoch=getattr(self, "epoch", -1), step=getattr(self, "ni", -1), parameter=bad_parameter
             )
-            if not self.scaler.is_enabled():
-                self.optimizer.zero_grad()
-                return False
-            # scaler.update() alone cannot downscale because it needs the
-            # found_inf state that step() records.  Calling step() here lets
-            # GradScaler detect the inf/NaN gradients, skip the optimizer step,
-            # and mark found_inf so update() will halve the scale.  Without
-            # this the scale stays at 65536 forever and every backward overflow
-            # continues to produce NaN gradients.  (PyTorch issue-like pattern.)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+        global_gradient_nonfinite = self._sync_nonfinite_flag(local_gradient_nonfinite)
+        self._gradient_nonfinite = getattr(self, "_gradient_nonfinite", False) or global_gradient_nonfinite
+        if global_gradient_nonfinite:
+            # No rank may update once any peer reports bad gradients. Updating
+            # only the finite ranks would immediately diverge model and optimizer state.
+            if self.scaler.is_enabled():
+                self.scaler.update()
             self.optimizer.zero_grad()
             return False
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
@@ -2383,7 +2388,9 @@ class BaseTrainer:
 
     def _handle_nan_recovery(self, epoch):
         """Recover only from globally confirmed nonfinite training state, never from zero fitness."""
-        loss_nonfinite = self.loss is not None and not bool(torch.isfinite(self.loss.detach()).all().item())
+        loss_nonfinite = bool(getattr(self, "_loss_nonfinite", False)) or (
+            self.loss is not None and not bool(torch.isfinite(self.loss.detach()).all().item())
+        )
         fitness_nonfinite = self.fitness is not None and not bool(np.isfinite(self.fitness))
         gradient_nonfinite = bool(getattr(self, "_gradient_nonfinite", False))
         ema_nonfinite = bool(getattr(self, "_ema_nonfinite", False))
@@ -2471,6 +2478,7 @@ class BaseTrainer:
             LOGGER.warning("[NaN recovery] Disabling AMP globally and retrying from the healthy checkpoint in FP32.")
         elif recovery_scaler_state is not None:
             self.scaler.load_state_dict(recovery_scaler_state)
+        self._loss_nonfinite = False
         self._gradient_nonfinite = False
         self._ema_nonfinite = False
         self._nonfinite_diagnostic = None

@@ -912,6 +912,10 @@ def attempt_compile(
     use_autocast: bool = False,
     warmup: bool = False,
     mode: bool | str = "default",
+    *,
+    backend: str = "inductor",
+    dynamic: bool = True,
+    warmup_input: torch.Tensor | None = None,
 ) -> torch.nn.Module:
     """Compile a model with torch.compile and optionally warm up the graph to reduce first-iteration latency.
 
@@ -927,6 +931,10 @@ def attempt_compile(
         warmup (bool, optional): Whether to execute a single dummy forward pass to warm up the compiled model.
         mode (bool | str, optional): torch.compile mode. True → "default", False → no compile, or a string like
             "default", "reduce-overhead", "max-autotune-no-cudagraphs".
+        backend (str, optional): torch.compile backend. ``inductor`` is used in production; ``eager`` is useful for
+            inexpensive compatibility tests.
+        dynamic (bool, optional): Allow shape changes without requiring a separate static graph for every input size.
+        warmup_input (Tensor, optional): Explicit sample input for modules whose input channels are not RGB.
 
     Returns:
         model (torch.nn.Module): Compiled model if compilation succeeds, otherwise the original unmodified model.
@@ -953,7 +961,8 @@ def attempt_compile(
         mode = "max-autotune-no-cudagraphs"
     t0 = time.perf_counter()
     try:
-        model = torch.compile(model, mode=mode, backend="inductor")
+        eager_model = model
+        model = torch.compile(model, mode=mode, backend=backend, dynamic=dynamic)
     except Exception as e:
         LOGGER.warning(f"{prefix} torch.compile failed, continuing uncompiled: {e}")
         return model
@@ -962,16 +971,20 @@ def attempt_compile(
     t_warm = 0.0
     if warmup:
         # Use a single dummy tensor to build the graph shape state and reduce first-iteration latency
-        dummy = torch.zeros(1, 3, imgsz, imgsz, device=device)
+        dummy = warmup_input.to(device) if warmup_input is not None else torch.zeros(1, 3, imgsz, imgsz, device=device)
         if use_autocast and device.type == "cuda":
             dummy = dummy.half()
         t1 = time.perf_counter()
-        with torch.inference_mode():
-            if use_autocast and device.type in {"cuda", "mps"}:
-                with torch.autocast(device.type):
+        try:
+            with torch.inference_mode():
+                if use_autocast and device.type in {"cuda", "mps"}:
+                    with torch.autocast(device.type):
+                        _ = model(dummy)
+                else:
                     _ = model(dummy)
-            else:
-                _ = model(dummy)
+        except Exception as e:
+            LOGGER.warning(f"{prefix} compiled warmup failed, continuing uncompiled: {e}")
+            return eager_model
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         t_warm = time.perf_counter() - t1

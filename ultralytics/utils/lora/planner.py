@@ -496,10 +496,13 @@ class PlacementDecision:
     target_modules_hint: Optional[List[str]] = None
     refusal_reason: Optional[str] = None
     safety_overrides: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.safety_overrides is None:
             self.safety_overrides = {}
+        if self.metadata is None:
+            self.metadata = {}
         if self.status not in ("ACCEPT", "REFUSE", "ADAPT"):
             raise ValueError(f"Invalid status: {self.status}")
 
@@ -512,6 +515,7 @@ class PlacementDecision:
             "predicted_delta": self.predicted_delta,
             "refusal_reason": self.refusal_reason,
             "safety_overrides": dict(self.safety_overrides),
+            "metadata": dict(self.metadata),
             "target_modules_hint_count": len(self.target_modules_hint or []),
         }
 
@@ -534,6 +538,7 @@ class DecisionAudit:
     predicted_delta: Optional[float] = None
     refusal_reason: Optional[str] = None
     safety_overrides: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
     target_modules_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -550,6 +555,7 @@ class DecisionAudit:
             "predicted_delta": self.predicted_delta,
             "refusal_reason": self.refusal_reason,
             "safety_overrides": self.safety_overrides,
+            "metadata": self.metadata,
             "target_modules_count": self.target_modules_count,
         }
 
@@ -1132,6 +1138,9 @@ class PEFTPlanner:
             Tuple[ArchitectureFingerprint, str, float]
         ] = []
         self._lovo_result: Optional[LOVOValidationResult] = None
+        self._fit_n_samples = 0
+        self._fit_effective_rank = 0
+        self._fit_n_features = len(self.DEFAULT_COEFFS)
         self._needs_refit = False  # Flag: re-fit on next plan() after new data
 
     def _maybe_fit_from_lovo(self) -> None:
@@ -1247,6 +1256,8 @@ class PEFTPlanner:
         import math
 
         self._history = history
+        self._fit_n_samples = len(history)
+        self._fit_effective_rank = 0
         if len(history) < 5:
             LOGGER.warning(
                 "[Planner] Insufficient calibration data (%d samples). "
@@ -1324,6 +1335,8 @@ class PEFTPlanner:
 
         # Compute matrix rank for diagnostic logging
         mat_rank = np.linalg.matrix_rank(X_arr)
+        self._fit_effective_rank = int(mat_rank)
+        self._fit_n_features = int(n_features)
         LOGGER.info(
             "[Planner] Fitted regression coefficients (12-dim, ridge λ=%.3f): %s",
             ridge_lambda, self._coeffs,
@@ -1426,8 +1439,9 @@ class PEFTPlanner:
         n_boot = min(50, len(self._history))
         n_history = len(self._history)
         boot_preds = []
+        rng = np.random.default_rng(0)
         for _ in range(n_boot):
-            idx = np.random.randint(0, n_history, size=n_history)
+            idx = rng.integers(0, n_history, size=n_history)
             boot_history = [self._history[i] for i in idx]
             boot_planner = PEFTPlanner()
             boot_planner.fit(boot_history)
@@ -1435,6 +1449,18 @@ class PEFTPlanner:
 
         std_error = float(np.std(boot_preds)) if len(boot_preds) > 1 else 0.02
         return point_pred, std_error
+
+    def _calibration_metadata(self) -> Dict[str, Any]:
+        """Return decision evidence describing the active regression calibration."""
+        fitted = len(self._history) >= 5
+        n_samples = self._fit_n_samples if fitted else 0
+        return {
+            "calibration_fitted": fitted,
+            "calibration_n_samples": n_samples,
+            "calibration_effective_rank": self._fit_effective_rank if fitted else 0,
+            "calibration_n_features": self._fit_n_features,
+            "low_confidence": bool(fitted and n_samples < 30),
+        }
 
     def plan(self, model: nn.Module, config: Any) -> PlacementDecision:
         """Generate a placement decision for the given model and config.
@@ -1494,6 +1520,7 @@ class PEFTPlanner:
         # Auto-fit from LOVO collector if available (regression-dominant
         # requires the model to be calibrated on catastrophic data when possible).
         self._maybe_fit_from_lovo()
+        calibration_metadata = self._calibration_metadata()
 
         # === Phase 1: Regression-dominant evaluation of ALL variants ===
         ALL_VARIANTS = [
@@ -1517,6 +1544,7 @@ class PEFTPlanner:
                 predicted_delta=None,
                 target_modules_hint=[],
                 safety_overrides={"planner_refused": True},
+                metadata=calibration_metadata,
             )
             self._save_audit(fingerprint, variant, rank, decision, targets_hint)
             return decision
@@ -1612,11 +1640,55 @@ class PEFTPlanner:
                 predicted_delta=requested_delta,
                 target_modules_hint=[],
                 safety_overrides={"planner_refused": True},
+                metadata=calibration_metadata,
             )
             self._save_audit(fingerprint, variant, rank, decision, targets_hint)
             return decision
 
         # === Phase 3: Regression-dominant decision ===
+
+        # Apply statistical gates only to a fitted calibration model. Default
+        # coefficients have no empirical sampling distribution and retain the
+        # established hard-guardrail behavior above.
+        if calibration_metadata["calibration_fitted"]:
+            requested_delta, requested_std_error = self.predict_with_uncertainty(fingerprint, variant, rank)
+            requested_lower_bound = requested_delta - 1.96 * requested_std_error
+            best_delta, best_std_error = self.predict_with_uncertainty(fingerprint, best_variant, rank)
+            best_lower_bound = best_delta - 1.96 * best_std_error
+            calibration_metadata.update(
+                {
+                    "prediction_std_error": requested_std_error,
+                    "prediction_lower_95": requested_lower_bound,
+                    "best_variant": best_variant,
+                    "best_prediction_std_error": best_std_error,
+                    "best_prediction_lower_95": best_lower_bound,
+                }
+            )
+            if requested_lower_bound < self.REFUSE_THRESHOLD:
+                if best_variant != variant and best_lower_bound >= self.REFUSE_THRESHOLD:
+                    decision = PlacementDecision(
+                        status="ADAPT",
+                        recommended_variant=best_variant,
+                        predicted_delta=best_delta,
+                        target_modules_hint=targets_hint,
+                        safety_overrides={"variant_adapted": True, "uncertainty_guard": True},
+                        metadata=calibration_metadata,
+                    )
+                    self._save_audit(fingerprint, variant, rank, decision, targets_hint)
+                    return decision
+                decision = PlacementDecision(
+                    status="REFUSE",
+                    refusal_reason=(
+                        f"Prediction 95% lower bound ({requested_lower_bound:.4f}) below threshold "
+                        f"({self.REFUSE_THRESHOLD}) for {variant}."
+                    ),
+                    predicted_delta=requested_delta,
+                    target_modules_hint=[],
+                    safety_overrides={"planner_refused": True, "uncertainty_guard": True},
+                    metadata=calibration_metadata,
+                )
+                self._save_audit(fingerprint, variant, rank, decision, targets_hint)
+                return decision
 
         # If the requested variant is architecturally incompatible.
         if not requested_compatible:
@@ -1627,6 +1699,7 @@ class PEFTPlanner:
                     predicted_delta=best_delta,
                     target_modules_hint=targets_hint,
                     safety_overrides={"variant_adapted": True},
+                    metadata=calibration_metadata,
                 )
                 self._save_audit(fingerprint, variant, rank, decision, targets_hint)
                 return decision
@@ -1639,6 +1712,7 @@ class PEFTPlanner:
                 predicted_delta=requested_delta,
                 target_modules_hint=[],
                 safety_overrides={"planner_refused": True},
+                metadata=calibration_metadata,
             )
             self._save_audit(fingerprint, variant, rank, decision, targets_hint)
             return decision
@@ -1654,6 +1728,7 @@ class PEFTPlanner:
                 predicted_delta=new_delta,
                 target_modules_hint=targets_hint,
                 safety_overrides=safety_overrides,
+                metadata=calibration_metadata,
             )
             self._save_audit(fingerprint, variant, rank, decision, targets_hint)
             return decision
@@ -1667,6 +1742,7 @@ class PEFTPlanner:
                     predicted_delta=best_delta,
                     target_modules_hint=targets_hint,
                     safety_overrides={"variant_adapted": True},
+                    metadata=calibration_metadata,
                 )
                 self._save_audit(fingerprint, variant, rank, decision, targets_hint)
                 return decision
@@ -1679,6 +1755,7 @@ class PEFTPlanner:
                 predicted_delta=requested_delta,
                 target_modules_hint=[],
                 safety_overrides={"planner_refused": True},
+                metadata=calibration_metadata,
             )
             self._save_audit(fingerprint, variant, rank, decision, targets_hint)
             return decision
@@ -1778,12 +1855,24 @@ class PEFTPlanner:
                 predicted_delta=requested_delta,
                 target_modules_hint=targets_hint,
                 safety_overrides=safety_overrides,
+                metadata=calibration_metadata,
+            )
+        elif calibration_metadata["low_confidence"]:
+            decision = PlacementDecision(
+                status="ADAPT",
+                recommended_variant=variant,
+                recommended_rank=rank if rank > 0 else None,
+                predicted_delta=requested_delta,
+                target_modules_hint=targets_hint,
+                safety_overrides={"planner_low_confidence": True},
+                metadata=calibration_metadata,
             )
         else:
             decision = PlacementDecision(
                 status="ACCEPT",
                 predicted_delta=requested_delta,
                 target_modules_hint=targets_hint,
+                metadata=calibration_metadata,
             )
 
         # DDP consistency: ensure all ranks reach the same decision.
@@ -1825,6 +1914,7 @@ class PEFTPlanner:
             "predicted_delta": decision.predicted_delta,
             "refusal_reason": decision.refusal_reason,
             "safety_overrides": decision.safety_overrides,
+            "metadata": decision.metadata,
             "target_modules_hint_count": len(decision.target_modules_hint or []),
         }
         container = [payload]
@@ -1843,6 +1933,7 @@ class PEFTPlanner:
                 predicted_delta=synced["predicted_delta"],
                 refusal_reason=synced["refusal_reason"],
                 safety_overrides=synced["safety_overrides"],
+                metadata=synced["metadata"],
                 target_modules_hint=decision.target_modules_hint,  # keep local targets
             )
         return decision
@@ -1881,6 +1972,7 @@ class PEFTPlanner:
                 predicted_delta=decision.predicted_delta,
                 refusal_reason=decision.refusal_reason,
                 safety_overrides=dict(decision.safety_overrides),
+                metadata=dict(decision.metadata),
                 target_modules_count=len(targets_hint),
             )
             audit.save(self.audit_dir)
