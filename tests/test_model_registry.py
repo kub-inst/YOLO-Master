@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTRY_PATH = ROOT / "docs/governance/model-registry.yaml"
 REQUIRED_FIELDS = {"name", "path", "task", "status", "blocks", "verified", "export"}
 VALID_STATUSES = {"stable", "experimental", "legacy", "blocked"}
+VALID_EXPORT_STATUSES = {"unverified", "component_roundtrip", "full_model_roundtrip", "blocked"}
 
 
 def test_model_registry_entries_are_well_formed_and_unique():
@@ -16,6 +17,7 @@ def test_model_registry_entries_are_well_formed_and_unique():
     entries = registry["models"]
 
     assert registry["schema_version"] == 1
+    assert "component_export_roundtrip" in registry["verification_policy"]
     assert entries
     assert len({entry["name"] for entry in entries}) == len(entries)
 
@@ -26,6 +28,15 @@ def test_model_registry_entries_are_well_formed_and_unique():
         assert isinstance(entry["blocks"], list)
         assert isinstance(entry["verified"], list)
         assert {"onnx", "tensorrt"} <= entry["export"].keys()
+        assert set(entry["export"].values()) <= VALID_EXPORT_STATUSES
+
+
+def test_component_export_evidence_is_not_reported_as_full_model_verification():
+    registry = yaml.safe_load(REGISTRY_PATH.read_text(encoding="utf-8"))
+    for entry in registry["models"]:
+        if entry["export"]["onnx"] == "component_roundtrip":
+            assert "component_export_roundtrip" in entry["verified"]
+            assert "full_model_export_roundtrip" not in entry["verified"]
 
 
 def test_registry_covers_phase1_model_smoke_configs():

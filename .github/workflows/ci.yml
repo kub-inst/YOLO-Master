@@ -7,6 +7,9 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  schedule:
+    - cron: "23 18 * * *"
+  workflow_dispatch:
 
 jobs:
   lint-and-import:
@@ -49,6 +52,16 @@ jobs:
           assert 'ES_MOE' in STABLE_MOE_CLASSES, 'ES_MOE missing from STABLE'
           print('MoE tier consistency: PASS')
           "
+      - name: MoE single implementation source
+        run: python scripts/check_moe_ssot.py
+      - name: MoE lifecycle audit contract
+        run: >-
+          python -m pytest -q
+          tests/test_moe_ssot.py
+          tests/test_moe_usage_audit.py
+          tests/test_model_registry.py
+          tests/test_mot_routing_diagnostics.py
+          --tb=long
       - name: Model build test (stable config)
         run: |
           python -c "
@@ -78,8 +91,28 @@ jobs:
         run: python -m pytest -q tests/test_default_config_integrity.py tests/test_master_model_configs.py tests/test_molora_dtype.py --tb=long
       - name: Core mixture smoke tests
         run: python -m pytest -q tests/test_moe.py tests/test_moa.py tests/test_mot.py --tb=long
+      - name: Existing torch.compile entrypoint compatibility
+        run: python -m pytest -q tests/test_mixture_compile.py --tb=long
       - name: Compile core mixture packages
         run: python -m compileall -q ultralytics/nn/modules ultralytics/nn/peft ultralytics/utils/lora ultralytics/vpeft
+
+  mixture-export-roundtrip:
+    name: Mixture export roundtrip gate
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install package and export runtimes
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" 2>/dev/null || pip install -e .
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install onnx onnxruntime
+      - name: Real TorchScript and ONNX roundtrip checks
+        run: python -m pytest -q tests/test_export_roundtrip.py --tb=long
 
   version-check:
     runs-on: ubuntu-latest
