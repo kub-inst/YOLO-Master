@@ -47,6 +47,17 @@ LocalConv   Window      Deformable
 | `yolo-master-moa-n.yaml` | MoE | C2fMoA | — | ✅ (×6) | **MoA 对比组** |
 | `yolo-master-moa-mot-n.yaml` | MoE | C2fMoA + C2fMoT | ✅ (×6) | ✅ (×1) | **MoA+MoT 混合** |
 
+### 实测参数与性能对比 (CPU, imgsz=640)
+
+| 模型 | Params | GFLOPs | Latency P50 | Latency P95 | MoT Block | MoA Block |
+|:---|---:|---:|---:|---:|---:|---:|
+| MoE 基线 | 3.45M | 8.03 | 51.7 ms | 53.4 ms | — | — |
+| MoA | 3.58M (+3.7%) | 8.30 (+3.4%) | 67.7 ms | 77.4 ms | — | 6 |
+| MoT | 4.06M (+17.6%) | 11.31 (+40.9%) | 184.1 ms | 194.2 ms | 6 | — |
+| MoA+MoT | 4.06M (+17.6%) | 11.31 (+40.9%) | 176.8 ms | 186.3 ms | 6 | 1 |
+
+> **分析：** MoT 的注意力操作在 CPU 上开销显著（+256% latency），但在 GPU 上差距会明显缩小。MoA 的 overhead 较温和（+31% latency）。混合架构 MoA+MoT 延迟与纯 MoT 接近。
+
 ### 训练命令
 
 ```bash

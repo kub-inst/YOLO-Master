@@ -246,6 +246,7 @@ def test_mot_block_handles_very_wide_feature_map():
 
 def test_mot_deformable_expert_handles_extreme_offsets():
     """Deformable expert must produce finite output with near-boundary offsets."""
+    import torch.nn as nn
     from ultralytics.nn.modules.mot.mot import _DeformableTransformerExpert
 
     torch.manual_seed(0)
