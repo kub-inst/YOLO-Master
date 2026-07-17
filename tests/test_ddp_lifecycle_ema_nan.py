@@ -194,7 +194,7 @@ def test_nonfinite_amp_recovery_switches_to_fp32(tmp_path):
     assert t.scaler.is_enabled() is False
 
 
-def test_nonfinite_gradient_is_consumed_by_scaler_before_clear():
+def test_nonfinite_gradient_skips_optimizer_on_all_ranks():
     class RecordingScaler:
         def __init__(self):
             self.events = []
@@ -210,7 +210,6 @@ def test_nonfinite_gradient_is_consumed_by_scaler_before_clear():
 
         def step(self, optimizer):
             self.events.append("step")
-            assert trainer.optimizer.param_groups[0]["params"][0].grad is not None
 
         def update(self):
             self.events.append("update")
@@ -230,8 +229,53 @@ def test_nonfinite_gradient_is_consumed_by_scaler_before_clear():
     trainer.model.weight.grad = torch.full_like(trainer.model.weight, float("nan"))
     assert trainer.optimizer_step() is False
 
-    assert trainer.scaler.events == ["unscale", "step", "update"]
+    assert trainer.scaler.events == ["unscale", "update"]
     assert trainer.model.weight.grad is None
+
+
+def test_remote_nonfinite_gradient_prevents_local_optimizer_commit():
+    trainer = object.__new__(BaseTrainer)
+    trainer.model = nn.Linear(1, 1)
+    trainer.optimizer = torch.optim.SGD(trainer.model.parameters(), lr=0.1)
+    trainer.scaler = torch.amp.GradScaler("cuda", enabled=False)
+    trainer.ema = None
+    trainer._gradient_nonfinite = False
+    trainer._nonfinite_diagnostic = None
+    trainer.device = torch.device("cpu")
+    trainer.model(torch.ones(1, 1)).sum().backward()
+    initial_weight = trainer.model.weight.detach().clone()
+
+    def report_remote_nonfinite(flag, op):
+        assert op == torch.distributed.ReduceOp.MAX
+        flag.fill_(1)
+
+    with patch("ultralytics.engine.trainer.RANK", 1), patch(
+        "torch.distributed.is_initialized", return_value=True
+    ), patch("torch.distributed.get_backend", return_value="gloo"), patch(
+        "torch.distributed.all_reduce", side_effect=report_remote_nonfinite
+    ) as all_reduce:
+        assert trainer.optimizer_step() is False
+
+    all_reduce.assert_called_once()
+    assert trainer._gradient_nonfinite is True
+    assert torch.equal(trainer.model.weight, initial_weight)
+    assert trainer.model.weight.grad is None
+
+
+def test_remote_nonfinite_loss_is_shared_with_local_rank():
+    trainer = object.__new__(BaseTrainer)
+    trainer.device = torch.device("cpu")
+
+    def report_remote_nonfinite(flag, op):
+        assert op == torch.distributed.ReduceOp.MAX
+        flag.fill_(1)
+
+    with patch("ultralytics.engine.trainer.RANK", 1), patch(
+        "torch.distributed.is_initialized", return_value=True
+    ), patch("torch.distributed.get_backend", return_value="gloo"), patch(
+        "torch.distributed.all_reduce", side_effect=report_remote_nonfinite
+    ):
+        assert trainer._sync_nonfinite_flag(False) is True
 
 
 def test_finite_optimizer_step_reports_commit():
