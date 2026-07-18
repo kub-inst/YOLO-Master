@@ -122,6 +122,59 @@ Tune batch size smaller if you encountered OOM (CUDA out of memory) errors.
 
 A training of 100 epochs can already achieve a high mAP. **Only train for 300 or more epochs if you have enough GPU memory or want to challenge the SOTA.** 
 
+---
+
+### ⚡️(NEW!) DDP Training
+The default scripts `reproduce_visdrone.py`, `reproduce_sku110k.py`, and `reproduce_aitodv2.py` only work with a single GPU. Here, we also provide a script dedicated to distributed training. It is compatible with both baseline models (`v0.1-N` and `EsMoE-N`) and the three datasets in the default scripts, and runs smoothly on NVIDIA's mainstream datacenter GPUs (we have tested A100, H100, H200, and B200).
+
+> **Note:** it runs **within a single node** only, and will not work across multiple physical servers even if they are joined by an InfiniBand switch.
+
+#### Commands
+
+Multi-GPU DDP is triggered by a **comma-separated `--device`** with **≥ 2 GPUs**. `--batch` is the **total** batch, split evenly across the GPUs.
+
+```bash
+# VisDrone — EsMoE-N on 4 GPUs
+python scripts/reproduce/reproduce_ddp.py --dataset VisDrone --model EsMoE-N \
+    --device 0,1,2,3 --batch 128 --epochs 300 --no-sparse-eval --workers 0
+
+# SKU-110K — v0.1-N on 2 GPUs
+python scripts/reproduce/reproduce_ddp.py --dataset SKU-110K --model v0.1-N \
+    --device 0,1 --batch 64 --epochs 300 --workers 0
+
+# AI-TOD-v2 — v0.1-N on 8 GPUs (imgsz auto-set to 800)
+python scripts/reproduce/reproduce_ddp.py --dataset AI-TOD-v2 --model v0.1-N \
+    --device 0,1,2,3,4,5,6,7 --batch 256 --epochs 300 --workers 0
+
+# Train both models on a dataset, sequentially
+python scripts/reproduce/reproduce_ddp.py --dataset VisDrone --model both --device 0,1,2,3 --batch 128 --workers 0
+
+# Preview the plan without launching (or validate the model builds with --check-build)
+python scripts/reproduce/reproduce_ddp.py --dataset VisDrone --model EsMoE-N --device 0,1 --dry-run
+```
+
+**Key flags**
+
+| Flag | Meaning |
+| --- | --- |
+| `--dataset` | `VisDrone` / `SKU-110K` / `AI-TOD-v2` |
+| `--model` | `v0.1-N`, `EsMoE-N`, or `both` |
+| `--device` | comma-separated GPU ids, **≥ 2** (single GPU / CPU is refused) |
+| `--batch` | **total** batch across all GPUs (keep it divisible by the GPU count) |
+| `--no-sparse-eval` | corrected dense evaluation for `EsMoE-N` (no-op for `v0.1-N`) |
+| `--lr0` / `--optimizer` | LR override for large-batch scaling (e.g. `--lr0 0.04` at large batch; forces SGD) |
+| `--cache ram \| disk` | cache decoded images in RAM or on disk; omit to read on the fly |
+| `--workers` | dataloader workers **per GPU** (see note below) |
+
+> **Tip — `--workers 0`:** on the Python 3.14 stack, dataloader worker processes can stall DDP setup on some hosts. `--workers 0` loads data in the main process (a little slower per step) and is the reliable default; you can increase it once a run is confirmed stable.
+
+**Notes**
+- Runs are **resumable** — re-issuing the same command continues from `last.pt`.
+- Uses the single-node convention (GPUs `0..N-1`). To pin specific GPUs, set `CUDA_VISIBLE_DEVICES=4,5` and pass `--device 0,1`.
+- For a large batch, scale the learning rate (linear rule, e.g. `--batch 512 --lr0 0.04`).
+
+---
+
 ### Expected results
 
 `v0.1-N` trains and validates cleanly all three datasets. `EsMoE-N` **trains correctly** on VisDrone & SKU-110k (its train losses track `v0.1-N`), ***but with the default sparse evaluation its validation mAP collapses***; `--no-sparse-eval` restores it to the `v0.1-N` level **(see Known issue 1 for the mechanism)** on VisDrone & SKU-110k. Moreover, `EsMoE-N`'s routering mechanism **completely collapsed** on AI-TOD-v2 even with `--no-sparse-eval` due to the scale and high complexity of the dataset **(see Known issue 4)**. 
