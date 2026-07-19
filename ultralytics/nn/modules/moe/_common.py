@@ -7,6 +7,8 @@ registry, snapshot recording, robust deepcopy, and the consolidated import block
 """
 import os
 import math
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,17 +24,25 @@ from .routers import (
     AdaptiveRoutingLayer, DynamicRoutingLayer, AdvancedRoutingLayer
 )
 from ultralytics.nn.modules.block import ABlock, A2C2f, C3k
-from torch.amp import autocast as _autocast
+
+try:
+    from torch.amp import autocast as _device_autocast
+except ImportError:  # torch<1.10
+    _device_autocast = None
+from torch.cuda.amp import autocast as _cuda_autocast
+
 
 def autocast(enabled=True, **kwargs):
     """Device-agnostic autocast wrapper. Falls back gracefully on non-CUDA devices."""
     if torch.cuda.is_available():
-        return _autocast('cuda', enabled=enabled, **kwargs)
-    if torch.backends.mps.is_available():
-        return _autocast('mps', enabled=enabled, **kwargs)
+        if _device_autocast is not None:
+            return _device_autocast("cuda", enabled=enabled, **kwargs)
+        return _cuda_autocast(enabled=enabled, **kwargs)
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available() and _device_autocast is not None:
+        return _device_autocast("mps", enabled=enabled, **kwargs)
     # On CPU, autocast is not fully supported; disable to avoid warnings/errors
-    from contextlib import nullcontext
-    return nullcontext() if not enabled else nullcontext()
+    return nullcontext()
 from .loss import MoELoss, gshard_balance_loss, weighted_gshard_balance_loss, differentiable_balance_loss, all_reduce_mean
 from .scheduler import MoEDynamicScheduler, MoEDynamicSchedulerConfig
 from ..routing_protocol import publish_aux_loss

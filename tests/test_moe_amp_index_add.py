@@ -5,9 +5,11 @@ accumulators often stay fp16. ``index_add_`` then raises:
 
     RuntimeError: index_add_(): self (Half) and source (Float) must have the same scalar type
 """
+
 import torch
 import torch.nn as nn
 
+from ultralytics.nn.modules.moe import _common
 from ultralytics.nn.modules.moe.experts import SharedInvertedExpertGroup
 from ultralytics.nn.modules.moe.utils import index_add_aligned_
 
@@ -21,6 +23,22 @@ class _Fp32Proj(nn.Module):
 
     def forward(self, t):
         return self.inner(t).float()
+
+
+def test_autocast_supports_legacy_torch_cuda_api(monkeypatch):
+    sentinel = object()
+    calls = []
+
+    def legacy_autocast(*, enabled):
+        calls.append(enabled)
+        return sentinel
+
+    monkeypatch.setattr(_common, "_device_autocast", None)
+    monkeypatch.setattr(_common, "_cuda_autocast", legacy_autocast)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    assert _common.autocast(enabled=True) is sentinel
+    assert calls == [True]
 
 
 def test_index_add_aligned_casts_float_into_half():
