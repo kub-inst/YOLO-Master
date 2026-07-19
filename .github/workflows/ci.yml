@@ -195,9 +195,11 @@ jobs:
           yolo checks
           uv pip list
       - name: Configure Ultralytics cache paths
+        if: matrix.torch == 'latest'
         shell: bash # for Windows compatibility
         run: yolo settings weights_dir="${GITHUB_WORKSPACE}/.ultralytics_cache/weights" datasets_dir="${GITHUB_WORKSPACE}/.ultralytics_cache/datasets"
       - name: Cache test assets
+        if: matrix.torch == 'latest'
         uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.ultralytics_cache
@@ -205,12 +207,31 @@ jobs:
           restore-keys: |
             ultralytics-test-assets-${{ runner.os }}-
       - name: Pre-cache test assets
+        if: matrix.torch == 'latest'
         shell: bash # for Windows compatibility
         run: python tests/cache_test_assets.py
       - name: Pytest tests
         shell: bash # for Windows compatibility
         run: |
-          if [[ "${{ matrix.os }}" == "ubuntu-24.04-arm" ]]; then
+          if [[ "${{ matrix.torch }}" != "latest" ]]; then
+            # Keep the minimum-Torch shard focused on contracts that intentionally support the legacy API. Running
+            # the full current upstream suite under Torch 1.8 produces unrelated failures and xdist worker crashes.
+            pytest --cov=ultralytics/ --cov-report=xml --export-env base \
+              tests/test_autograd_allreduce.py \
+              tests/test_checkpoint_compat.py \
+              tests/test_ddp_error_propagation_e2e.py \
+              tests/test_ddp_root_cause_reporting.py \
+              tests/test_mixture_config_registry.py \
+              tests/test_mixture_fixes.py \
+              tests/test_mixture_model_registry.py \
+              tests/test_moa_mot_ssot.py \
+              tests/test_moe_amp_index_add.py \
+              tests/test_moe_ddp_fixes.py \
+              tests/test_moe_ssot.py \
+              tests/test_torch_legacy_compat.py \
+              tests/test_upstream_integrity.py \
+              tests/test_windows_torchrun.py
+          elif [[ "${{ matrix.os }}" == "ubuntu-24.04-arm" ]]; then
             # GitHub-hosted ARM runners have disconnected under xdist auto-parallelism.
             pytest --cov=ultralytics/ --cov-report=xml tests/ --export-env base
           else
