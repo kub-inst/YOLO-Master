@@ -16,12 +16,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
-import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -101,14 +98,14 @@ def step_routing_analysis(args: argparse.Namespace) -> int:
     )
     if not Path(model_path).exists():
         print(f"\n  ⚠️  Checkpoint 不存在: {model_path}")
-        print(f"  先运行训练，或通过 --checkpoint 指定已有权重")
+        print("  先运行训练，或通过 --checkpoint 指定已有权重")
         return 1
 
     # 真实图片分析（如果数据集已下载）
     image_dir = args.image_dir
     synthetic_flag = []
     if not image_dir or not Path(image_dir).exists():
-        print(f"\n  未找到图片目录，使用合成场景数据")
+        print("\n  未找到图片目录，使用合成场景数据")
         synthetic_flag = ["--synthetic"]
         image_dir_flag = []
     else:
@@ -153,9 +150,7 @@ def print_results_summary() -> None:
     if summary_csv.exists():
         with open(summary_csv) as f:
             rows = list(csv.DictReader(f))
-        print(f"\n📈 训练结果")
-        headers = ["label", "epoch", "metrics/mAP50(B)", "metrics/mAP50-95(B)",
-                    "nan_detected", "loss_diverged"]
+        print("\n📈 训练结果")
         print(f"  {'模型':<18} {'Epoch':>6} {'mAP50':>8} {'mAP50-95':>8} {'NaN':>6} {'发散':>6}")
         print(f"  {'─'*18} {'─'*6} {'─'*8} {'─'*8} {'─'*6} {'─'*6}")
         for r in rows:
@@ -174,15 +169,15 @@ def print_results_summary() -> None:
         with open(deformable_csv) as f:
             rows = list(csv.DictReader(f))
         significant = [r for r in rows if r.get("deformable_significantly_higher") == "True"]
-        print(f"\n🎯 DeformableTransformer 遮挡场景激活检验:")
+        print("\n🎯 DeformableTransformer 遮挡场景激活检验:")
         if significant:
             for r in significant:
                 print(f"  ✅ {r['metric']}: 遮挡场景显著高于 {r['baseline']}")
                 print(f"     irregular={r['irregular_mean']} vs baseline={r['baseline_mean']}")
                 print(f"     p={r['permutation_p_value_one_sided']}, lift={r['relative_lift']}")
         else:
-            print(f"  ⚠️  合成数据上 Deformable 激活率无显著差异（模型未训练）")
-            print(f"  用真实训练好的 checkpoint 重新运行 --routing-only 获取有意义结果")
+            print("  ⚠️  合成数据上 Deformable 激活率无显著差异（模型未训练）")
+            print("  用真实训练好的 checkpoint 重新运行 --routing-only 获取有意义结果")
 
 
 def parse_args() -> argparse.Namespace:
@@ -248,11 +243,11 @@ def main() -> int:
     print_results_summary()
 
     print(f"\n📁 所有输出在: {ROOT / 'runs/mot_ablation/'}")
-    print(f"   build_summary.csv     — 模型结构对比")
-    print(f"   latency_*.csv         — 延迟 Benchmark")
-    print(f"   v10*/results.csv      — 各变体训练日志")
-    print(f"   summary.csv           — 最终汇总对比")
-    print(f"   routing/              — 路由可解释性分析")
+    print("   build_summary.csv     — 模型结构对比")
+    print("   latency_*.csv         — 延迟 Benchmark")
+    print("   v10*/results.csv      — 各变体训练日志")
+    print("   summary.csv           — 最终汇总对比")
+    print("   routing/              — 路由可解释性分析")
     return 0
 
 

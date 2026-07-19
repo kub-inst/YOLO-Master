@@ -160,7 +160,6 @@ def test_mot_window_expert_shift_spatial_alignment():
     The shift/un-shift residual alignment is the subtle correctness point: an
     identity-ish check ensures no cyclic spatial misalignment leaks through.
     """
-    from ultralytics.nn.modules.mot.mot import _WindowTransformerExpert
 
     torch.manual_seed(0)
     block = MoTBlock(32, num_heads=4, top_k=2, window_size=5, n_points=2, window_shift=True).eval()
