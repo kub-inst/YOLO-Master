@@ -980,8 +980,10 @@ def anneal_moa_temperature(model: nn.Module, factor: float = 0.99,
             m.temperature = max(m.temperature * factor, min_temp)
 
 
-def _aux_loss_device(model: nn.Module) -> torch.device:
+def _aux_loss_device(model: nn.Module | None) -> torch.device:
     """Best-effort device lookup for zero aux-loss fallbacks."""
+    if model is None:
+        return torch.device("cpu")
     try:
         return next(model.parameters()).device
     except StopIteration:
