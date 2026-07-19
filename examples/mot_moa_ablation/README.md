@@ -58,15 +58,17 @@ LocalConv   Window      Deformable
 
 > **分析：** GPU 上 MoT 开销合理（+82% latency vs +256% on CPU）。MoA 开销最温和（+49% GPU）。混合架构 MoA+MoT 延迟与纯 MoT 接近。
 
-### 实测训练结果 (VisDrone 30 epochs)
+### 实测训练结果 (VisDrone 30 epochs, AdamW, from scratch)
 
 | 模型 | mAP50 | mAP50-95 | Params | GPU P50 | 训练稳定性 |
 |:---|---:|---:|---:|---:|:---:|
-| MoE 基线 | **0.362** | 0.261 | 3.45M | 23.3 ms | ✅ |
-| MoT | 0.353 | **0.268** | 4.06M | 42.4 ms | ✅ |
-| MoA | **0.362** | 0.257 | 3.58M | 34.8 ms | ✅ |
+| MoE 基线 | **0.254** | 0.142 | 3.45M | 23.3 ms | ✅ |
+| MoT | 0.251 | 0.141 | 4.06M | 42.4 ms | ✅ |
+| MoA | 0.248 | 0.141 | 3.58M | 34.8 ms | ✅ |
 
-> **关键发现：** MoT 的 mAP50-95 最高（0.268），比 MoE 基线高 2.7%，说明多专家注意力有助于提升定位精度。MoA 的 mAP50 与 MoE 持平但 mAP50-95 略低。
+> **分析：** 30 epochs 下三者 mAP 接近（<3% 差异），说明短时训练中架构差异尚未充分体现。
+> 参考：EsMoE-N 在 VisDrone 上训练 300 epochs (SGD) 可达到 mAP50-95=0.203（见 `scripts/reproduce/README.md`）。
+> 本实验主要验证三点：(1) 三种架构均可稳定训练；(2) 路由分析揭示领域自适应行为；(3) 延迟/参数权衡。
 
 ### 实测路由分析 — 场景对比重大发现
 
@@ -86,9 +88,9 @@ LocalConv   Window      Deformable
 
 | # | 推荐 | 数据支撑 |
 |:--|:---|:---|
-| 1 | **密集航拍/小目标 → MoT** | VisDrone mAP50-95 最高 (0.268)，Deformable 激活率 +94% |
-| 2 | **通用检测/服务器端 → MoE 基线** | mAP50 最高 (0.362)，延迟最低 (23.3ms)，参数最少 (3.45M) |
-| 3 | **边缘端部署 → MoE** | MoT CPU 延迟 184ms，MoE 仅 52ms；GPU 上 MoT 42ms vs MoE 23ms |
+| 1 | **密集航拍小目标 → MoT** | DeformableTransformer 激活率在 VisDrone 上 +94%（20.7%→40.1%），架构天然适配密集/不规则目标 |
+| 2 | **通用检测/服务器 → MoE 基线** | 30 epochs mAP 三者持平（0.14），MoE 延迟最低（23.3ms GPU / 52ms CPU）、参数最少（3.45M） |
+| 3 | **大规模训练 (300+ epochs) → MoE** | 已有 benchmark 证明 EsMoE-N 在 VisDrone 300 epochs 达 mAP50-95=0.203，MoA/MoT 缺乏同等规模对比数据 |
 
 ### 训练命令
 
