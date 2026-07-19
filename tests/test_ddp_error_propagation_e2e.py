@@ -1,11 +1,10 @@
 import os
 import subprocess
-import sys
 
 import pytest
 
-from ultralytics.utils import MACOS
-from ultralytics.utils.dist import ddp_launch_env, find_free_network_port
+from ultralytics.utils import MACOS, WINDOWS
+from ultralytics.utils.dist import ddp_launch_env, ddp_launch_prefix, find_free_network_port
 from ultralytics.utils.torch_utils import TORCH_1_9
 
 
@@ -28,16 +27,14 @@ def test_torchrun_rank1_marker_reaches_parent_output(tmp_path):
     )
     worker.write_text(worker_source, encoding="utf-8")
     command = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run" if TORCH_1_9 else "torch.distributed.launch",
+        *ddp_launch_prefix(),
         "--master_addr=127.0.0.1",
         f"--master_port={find_free_network_port()}",
         "--nproc_per_node=2",
     ]
     if TORCH_1_9:
         command.extend(["--log-dir", str(logs)])
-        if not MACOS:
+        if not (MACOS or WINDOWS):
             command.extend(["--tee", "3"])
     command.append(str(worker))
     result = subprocess.run(

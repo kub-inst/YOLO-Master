@@ -1,8 +1,10 @@
+import sys
 from pathlib import Path
 from types import SimpleNamespace
-from ultralytics.utils import MACOS
+
+from ultralytics.utils import MACOS, WINDOWS
 from ultralytics.utils import dist as dist_utils
-from ultralytics.utils.dist import collect_ddp_error_logs, ddp_launch_env, generate_ddp_command
+from ultralytics.utils.dist import collect_ddp_error_logs, ddp_launch_env, ddp_launch_prefix, generate_ddp_command
 from ultralytics.utils.torch_utils import TORCH_1_9
 
 
@@ -24,7 +26,7 @@ def test_worker_record_and_launch_logging(tmp_path):
         compile(c, f, "exec")
         if TORCH_1_9:
             assert "--log-dir" in cmd
-            assert ("--tee" in cmd) is not MACOS
+            assert ("--tee" in cmd) is not (MACOS or WINDOWS)
             assert d.ddp_log_dir
         else:
             assert "--log-dir" not in cmd and "--tee" not in cmd
@@ -47,3 +49,10 @@ def test_windows_ddp_launch_disables_libuv(monkeypatch):
     monkeypatch.setenv("USE_LIBUV", "1")
 
     assert ddp_launch_env()["USE_LIBUV"] == "0"
+
+
+def test_windows_ddp_launch_uses_compat_entrypoint(monkeypatch):
+    monkeypatch.setattr(dist_utils, "WINDOWS", True)
+    monkeypatch.setattr(dist_utils, "TORCH_1_9", True)
+
+    assert ddp_launch_prefix() == [sys.executable, "-m", "ultralytics.utils.torchrun"]

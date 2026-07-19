@@ -23,6 +23,14 @@ def ddp_launch_env() -> dict[str, str]:
     return env
 
 
+def ddp_launch_prefix() -> list[str]:
+    """Return the Python module prefix for a platform-compatible distributed launch."""
+    if WINDOWS and TORCH_1_9:
+        return [sys.executable, "-m", "ultralytics.utils.torchrun"]
+    module = "torch.distributed.run" if TORCH_1_9 else "torch.distributed.launch"
+    return [sys.executable, "-m", module]
+
+
 def find_free_network_port() -> int:
     """Find a free port on localhost.
 
@@ -142,12 +150,9 @@ def generate_ddp_command(trainer: BaseTrainer) -> tuple[list[str], str]:
     if not trainer.resume:
         shutil.rmtree(trainer.save_dir)  # remove the save_dir
     file = generate_ddp_file(trainer)
-    dist_cmd = "torch.distributed.run" if TORCH_1_9 else "torch.distributed.launch"
     port = find_free_network_port()
     cmd = [
-        sys.executable,
-        "-m",
-        dist_cmd,
+        *ddp_launch_prefix(),
         "--nproc_per_node",
         f"{trainer.world_size}",
         "--master_port",
@@ -158,7 +163,7 @@ def generate_ddp_command(trainer: BaseTrainer) -> tuple[list[str], str]:
         log_dir = USER_CONFIG_DIR / "DDP" / f"logs_{id(trainer)}"
         log_dir.mkdir(parents=True, exist_ok=True)
         cmd.extend(["--log-dir", str(log_dir)])
-        if not MACOS:
+        if not (MACOS or WINDOWS):
             cmd.extend(["--tee", "3"])
     cmd.append(file)
     trainer.ddp_log_dir = log_dir
