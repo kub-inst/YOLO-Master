@@ -72,17 +72,19 @@ LocalConv   Window      Deformable
 
 ### 实测路由分析 — 场景对比重大发现
 
-| 场景 | 来源 | LocalConv | Window | Deformable |
+| 场景 | 训练数据 | LocalConv | Window | Deformable |
 |:---|---:|---:|---:|:---|
-| **VisDrone (密集航拍)** | 真实 548 张 | 26.4% | 33.5% | **40.1%** |
-| COCO128 (通用目标) | 真实 128 张 | 25.1% | **54.2%** | 20.7% |
+| **VisDrone (密集航拍)** | VisDrone | 26.4% | 33.5% | **40.1%** |
+| COCO128 (通用目标) | COCO128 | 25.4% | **53.4%** | 21.2% |
 
-> **核心发现：DeformableTransformer 在密集航拍小目标场景激活率 +94%（20.7%→40.1%）！**
+> **核心发现：DeformableTransformer 在 VisDrone 上的激活率是 COCO 的 1.89 倍（21.2%→40.1%）！**
 >
-> 这直接验证了 MoT 的专家自适应假设：
+> 这验证了 MoT 的领域自适应路由：
 > 1. DeformableTransformer 的稀疏可变形采样天然适合密集、不规则分布的小目标
-> 2. WindowTransformer 在通用场景（COCO，规则中大目标）主导
-> 3. Router 确实学会了根据场景特征分配专家，而非简单记忆
+> 2. WindowTransformer 在通用目标场景（COCO）中占主导
+> 3. Router 根据训练数据的领域特征学会了不同的专家分配策略
+>
+> **⚠️ 说明：** 两项路由分析使用了不同训练数据训练的模型（coco128 模型 + COCO 图片 vs VisDrone 模型 + VisDrone 图片），因此路由差异同时包含了训练分布和测试分布的影响。理想对比应用同一模型跨数据集测试。
 
 ### 场景化推荐 (数据支撑)
 
