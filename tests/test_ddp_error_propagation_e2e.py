@@ -1,5 +1,8 @@
+import os
 import subprocess
 import sys
+
+import pytest
 
 from ultralytics.utils import MACOS
 from ultralytics.utils.dist import ddp_launch_env, find_free_network_port
@@ -10,6 +13,9 @@ MARKER = "DDP_E2E_UNIQUE_MARKER_7F3A"
 
 
 def test_torchrun_rank1_marker_reaches_parent_output(tmp_path):
+    if MACOS and os.environ.get("PYTEST_XDIST_WORKER"):
+        pytest.skip("Nested torchrun under xdist is unreliable on macOS; covered serially and on Linux")
+
     worker = tmp_path / "worker.py"
     logs = tmp_path / "logs"
     elastic_import = "from torch.distributed.elastic.multiprocessing.errors import record\n@record\n" if TORCH_1_9 else ""
