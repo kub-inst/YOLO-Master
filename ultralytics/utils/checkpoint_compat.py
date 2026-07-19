@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from ultralytics import __version__
+from ultralytics.utils.patches import torch_load
 from ultralytics.utils.torch_utils import unwrap_model
 
 ADAPTER_TOKENS = ("lora_", "hada_", "lokr_", "ia3_", "boft_", "oft_")
@@ -141,7 +142,7 @@ def inspect_checkpoint_artifact(source: str | Path) -> CheckpointCompatibilityRe
         )
 
     try:
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload = torch_load(path, map_location="cpu", weights_only=False)
     except (AttributeError, ImportError, ModuleNotFoundError):
         payload = None
     if _is_molora_payload(payload):
@@ -301,7 +302,7 @@ def convert_checkpoint_artifact(
         return report
 
     try:
-        payload = torch.load(source_path, map_location="cpu", weights_only=False)
+        payload = torch_load(source_path, map_location="cpu", weights_only=False)
     except (AttributeError, ImportError, ModuleNotFoundError):
         payload = None
     destination_path.parent.mkdir(parents=True, exist_ok=True)

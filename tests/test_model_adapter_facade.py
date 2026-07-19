@@ -2,13 +2,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-import torch
 import torch.nn as nn
 
 from ultralytics.engine.model import Model
 from ultralytics.nn.peft.molora import MoLoRAConfig, MoLoRAModel
 from ultralytics.utils.lora import LoRAConfig, adapter_metadata
 from ultralytics.utils.lora.fallback import ManualLoRAConv, apply_manual_lora
+from ultralytics.utils.patches import torch_load
 
 
 def _facade(model: nn.Module, trainer_model: nn.Module | None = None) -> Model:
@@ -105,7 +105,7 @@ def test_facade_save_records_mixture_checkpoint_metadata(tmp_path):
     checkpoint = tmp_path / "model.pt"
 
     facade.save(checkpoint)
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    payload = torch_load(checkpoint, map_location="cpu", weights_only=False)
 
     assert payload["mixture_checkpoint"]["schema_version"] == 1
     assert payload["mixture_checkpoint"]["graph"]["model_class"].endswith("Sequential")

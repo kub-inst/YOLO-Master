@@ -6,12 +6,26 @@ accumulators often stay fp16. ``index_add_`` then raises:
     RuntimeError: index_add_(): self (Half) and source (Float) must have the same scalar type
 """
 
+import pytest
 import torch
 import torch.nn as nn
 
 from ultralytics.nn.modules.moe import _common
 from ultralytics.nn.modules.moe.experts import SharedInvertedExpertGroup
 from ultralytics.nn.modules.moe.utils import index_add_aligned_
+
+
+def _require_cpu_fp16_nn() -> None:
+    """Skip only when this PyTorch build lacks the CPU fp16 kernels exercised here."""
+    sample = torch.ones(1, 2, 2, 2, dtype=torch.float16)
+    try:
+        torch.softmax(sample, dim=1)
+        nn.SiLU()(sample)
+        nn.GroupNorm(1, 2)(sample)
+    except RuntimeError as exc:
+        if "not implemented for 'Half'" in str(exc):
+            pytest.skip(f"CPU fp16 operator unavailable: {exc}")
+        raise
 
 
 class _Fp32Proj(nn.Module):
@@ -52,6 +66,7 @@ def test_index_add_aligned_casts_float_into_half():
 
 
 def test_shared_inverted_index_add_amp_fp16_safe():
+    _require_cpu_fp16_nn()
     torch.manual_seed(0)
     B, C, H, W, E, K = 4, 32, 8, 8, 4, 2
     group = SharedInvertedExpertGroup(C, C, num_experts=E, top_k=K).train().half()
@@ -69,6 +84,8 @@ def test_gated_diversified_expert_index_add_amp_fp16_safe():
     """Crash site from training stack: gated.py Heterogeneous/Diversified path."""
     from ultralytics.nn.modules.moe.gated import DiversifiedExpertGroup
 
+    _require_cpu_fp16_nn()
+
     torch.manual_seed(0)
     B, C, H, W, E, K = 4, 32, 8, 8, 4, 2
     group = DiversifiedExpertGroup(C, C, num_experts=E, top_k=K).train().half()
@@ -83,6 +100,8 @@ def test_gated_diversified_expert_index_add_amp_fp16_safe():
 
 def test_adaptive_gate_moe_half_forward_backward():
     from ultralytics.nn.modules.moe import AdaptiveGateMoE
+
+    _require_cpu_fp16_nn()
 
     torch.manual_seed(0)
     moe = AdaptiveGateMoE(32, 32, num_experts=4, top_k=2).train().half()

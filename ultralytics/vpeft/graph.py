@@ -401,13 +401,23 @@ class ComputationGraphBuilder:
         return _SEMANTIC_ROLE_VOCAB["other"]
 
     @staticmethod
+    def _get_submodule(root: nn.Module, path: str) -> nn.Module:
+        """Resolve a dotted module path on PyTorch versions before ``get_submodule``."""
+        if hasattr(root, "get_submodule"):
+            return root.get_submodule(path)
+        module = root
+        for part in path.split("."):
+            module = getattr(module, part)
+        return module
+
+    @staticmethod
     def _ancestors(name: str, root: nn.Module) -> list[nn.Module]:
         """Resolve all module ancestors for structural role inference."""
         ancestors = []
         parts = name.split(".")
         for depth in range(1, len(parts)):
             try:
-                ancestors.append(root.get_submodule(".".join(parts[:depth])))
+                ancestors.append(ComputationGraphBuilder._get_submodule(root, ".".join(parts[:depth])))
             except (AttributeError, KeyError):
                 break
         return ancestors
@@ -473,14 +483,7 @@ class ComputationGraphBuilder:
             return 0
         parent_name, child_name = name.rsplit(".", 1)
         try:
-            parent = root.get_submodule(parent_name) if hasattr(root, "get_submodule") else None
-            if parent is None:
-                parts = parent_name.split(".")
-                parent = root
-                for p in parts:
-                    parent = getattr(parent, p, None)
-                    if parent is None:
-                        return 0
+            parent = ComputationGraphBuilder._get_submodule(root, parent_name)
             if isinstance(parent, nn.Sequential):
                 for idx, (n, _) in enumerate(parent.named_children()):
                     if n == child_name:

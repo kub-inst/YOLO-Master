@@ -8,11 +8,19 @@ import sys
 import tempfile
 from typing import TYPE_CHECKING
 
-from . import USER_CONFIG_DIR
+from . import MACOS, USER_CONFIG_DIR, WINDOWS
 from .torch_utils import TORCH_1_9
 
 if TYPE_CHECKING:
     from ultralytics.engine.trainer import BaseTrainer
+
+
+def ddp_launch_env() -> dict[str, str]:
+    """Return a torchrun environment compatible with Windows builds that omit libuv."""
+    env = os.environ.copy()
+    if WINDOWS:
+        env.setdefault("USE_LIBUV", "0")
+    return env
 
 
 def find_free_network_port() -> int:
@@ -145,10 +153,13 @@ def generate_ddp_command(trainer: BaseTrainer) -> tuple[list[str], str]:
         "--master_port",
         f"{port}",
     ]
-    log_dir = USER_CONFIG_DIR / "DDP" / f"logs_{id(trainer)}"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = None
     if TORCH_1_9:
-        cmd.extend(["--log-dir", str(log_dir), "--tee", "3"])
+        log_dir = USER_CONFIG_DIR / "DDP" / f"logs_{id(trainer)}"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        cmd.extend(["--log-dir", str(log_dir)])
+        if not MACOS:
+            cmd.extend(["--tee", "3"])
     cmd.append(file)
     trainer.ddp_log_dir = log_dir
     return cmd, file

@@ -38,6 +38,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_lf(path: Path) -> str:
+    """Hash text with Git's Windows checkout line endings normalized to LF."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def _tracked_files(items: Iterable[str]) -> list[str]:
     files: list[str] = []
     for item in items:
@@ -95,25 +100,20 @@ def build_manifest() -> dict:
 
 
 def verify_manifest(manifest: dict) -> list[str]:
-    """Return all integrity violations without mutating the manifest."""
+    """Return integrity violations without requiring the upstream tag in shallow clones."""
     errors: list[str] = []
     upstream = manifest.get("upstream", {})
     if upstream.get("commit") != UPSTREAM_COMMIT:
         errors.append(f"manifest commit mismatch: {upstream.get('commit')!r}")
-    try:
-        current_commit = _git_commit(UPSTREAM_REF)
-    except subprocess.CalledProcessError as exc:
-        errors.append(f"cannot resolve {UPSTREAM_REF}: {exc}")
-    else:
-        if current_commit != UPSTREAM_COMMIT:
-            errors.append(f"local {UPSTREAM_REF} mismatch: {current_commit}")
     for path, expected in manifest.get("exact_files", {}).items():
         file_path = ROOT / path
         if not file_path.is_file():
             errors.append(f"missing protected upstream file: {path}")
             continue
         actual = _sha256(file_path)
-        if actual != expected.get("sha256"):
+        expected_hash = expected.get("sha256")
+        text_suffix = file_path.suffix.lower() in {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
+        if actual != expected_hash and (not text_suffix or _sha256_lf(file_path) != expected_hash):
             errors.append(f"modified protected upstream file: {path}")
     return errors
 

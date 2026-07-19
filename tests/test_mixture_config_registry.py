@@ -8,7 +8,7 @@ from ultralytics.cfg import DEFAULT_CFG_DICT, get_cfg
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = ROOT.parent / "YOLO-Master-v0708/docs/governance/mixture-preservation-manifest.yaml"
+MANIFEST = ROOT / "docs/governance/mixture-preservation-manifest.yaml"
 
 
 def test_preserved_config_keys_are_registered_or_upstream_precision_aliases():

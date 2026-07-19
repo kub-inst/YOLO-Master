@@ -55,7 +55,7 @@ def test_moa_and_mot_configs_build_and_run():
     )
     for config in configs:
         model = DetectionModel(config, ch=3, nc=80, verbose=False).eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             output = model(torch.zeros(1, 3, 64, 64))
         assert output is not None
     assert any(isinstance(module, C2fMoA) for module in DetectionModel(configs[0], verbose=False).modules())

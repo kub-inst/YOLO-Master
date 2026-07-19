@@ -9,6 +9,7 @@ from ultralytics.engine.extensions import AdapterRuntimeController
 from ultralytics.engine.trainer import BaseTrainer, validate_adapter_configuration
 from ultralytics.nn.peft.molora import MoLoRAConfig, MoLoRALayer, get_peft_molora_model
 from ultralytics.utils.errors import MoERouterError
+from ultralytics.utils.patches import torch_load
 from ultralytics.utils.torch_utils import ModelEMA
 
 
@@ -35,6 +36,22 @@ class FuseSensitiveSmokeModel(ImageSmokeModel):
     def fuse(self, verbose=False):
         self.nonfinite = True
         return self
+
+
+class RTDETRDecoder(nn.Module):
+    def forward(self, x):
+        if min(x.shape[-2:]) < 128:
+            raise RuntimeError("selected index k out of range")
+        return x
+
+
+class RTDETRSmokeModel(ImageSmokeModel):
+    def __init__(self):
+        super().__init__()
+        self.decoder = RTDETRDecoder()
+
+    def forward(self, x):
+        return self.decoder(super().forward(x))
 
 
 def test_adapter_configuration_rejects_lora_and_molora_together():
@@ -154,7 +171,7 @@ def test_bootstrap_checkpoint_serializes_before_training_epoch_is_set(tmp_path):
     trainer.start_epoch = 7
     del trainer.epoch
 
-    checkpoint = torch.load(
+    checkpoint = torch_load(
         __import__("io").BytesIO(trainer._serialize_checkpoint()), map_location="cpu", weights_only=False
     )
 
@@ -166,7 +183,7 @@ def test_checkpoint_serialization_clamps_fp16_overflow_without_mutating_live_ema
     parameter = next(trainer.ema.ema.parameters())
     parameter.data.flatten()[0] = 1.0e5
 
-    checkpoint = torch.load(
+    checkpoint = torch_load(
         __import__("io").BytesIO(trainer._serialize_checkpoint()), map_location="cpu", weights_only=False
     )
 
@@ -429,6 +446,16 @@ def test_checkpoint_forward_smoke_covers_fused_fp32_path():
     assert "non-finite output" in reason
 
 
+def test_checkpoint_forward_smoke_uses_rtdetr_safe_minimum_shape():
+    t = object.__new__(BaseTrainer)
+    t.args = SimpleNamespace(imgsz=160)
+
+    healthy, reason = t._checkpoint_forward_smoke({"model": RTDETRSmokeModel(), "ema": None})
+
+    assert healthy is True
+    assert reason == ""
+
+
 def test_save_model_does_not_overwrite_last_or_best_when_health_gate_fails(tmp_path):
     t = object.__new__(BaseTrainer)
     t.wdir = tmp_path
@@ -580,7 +607,7 @@ def test_bootstrap_checkpoint_precedes_first_nonfinite_recovery(tmp_path):
     t = bootstrap_trainer(tmp_path)
     with patch("ultralytics.engine.trainer.RANK", -1):
         t._bootstrap_healthy_checkpoint()
-    payload = torch.load(t.healthy, map_location="cpu", weights_only=False)
+    payload = torch_load(t.healthy, map_location="cpu", weights_only=False)
     assert BaseTrainer._state_is_finite(payload)
     assert payload["optimizer"] is not None
     assert payload["scaler"] == t.scaler.state_dict()

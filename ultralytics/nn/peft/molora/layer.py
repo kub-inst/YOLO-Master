@@ -4,6 +4,9 @@ Contains:
   - MoLoRAExpert: a single LoRA expert (Conv2d or Linear low-rank pair)
   - MoLoRALayer: a wrapper that replaces a base layer with top-k sparse experts
 """
+
+from __future__ import annotations
+
 import math
 from typing import Any, Dict, List, Optional
 

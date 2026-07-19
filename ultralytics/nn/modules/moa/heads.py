@@ -268,6 +268,9 @@ class _GlobalAttnHead(nn.Module):
         q, k, v: [B, nh, N, hd]
         """
         B, nh, N, hd = q.shape
+        output_dtype = q.dtype
+        if output_dtype in (torch.float16, torch.bfloat16):
+            q, k, v = q.float(), k.float(), v.float()
         rf = self._get_rf(q.device, q.dtype)     # [eff_nb, hd]
         eff_nb = rf.shape[0]
         scale = eff_nb ** -0.5
@@ -299,7 +302,7 @@ class _GlobalAttnHead(nn.Module):
         # denominator: q @ k_sum^T → [B*nh, N, 1]; cast k_sum back to q.dtype for matmul
         denom = (q_flat @ k_sum_f32.to(q_flat.dtype).unsqueeze(-1)).clamp(min=_fp_min(1e-6, q_flat.dtype))
 
-        return (numer / denom).reshape(B, nh, N, hd)
+        return (numer / denom).reshape(B, nh, N, hd).to(output_dtype)
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

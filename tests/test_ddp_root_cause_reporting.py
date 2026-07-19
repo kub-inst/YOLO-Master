@@ -1,6 +1,9 @@
 from pathlib import Path
 from types import SimpleNamespace
-from ultralytics.utils.dist import collect_ddp_error_logs, generate_ddp_command
+from ultralytics.utils import MACOS
+from ultralytics.utils import dist as dist_utils
+from ultralytics.utils.dist import collect_ddp_error_logs, ddp_launch_env, generate_ddp_command
+from ultralytics.utils.torch_utils import TORCH_1_9
 
 
 class D:
@@ -19,8 +22,13 @@ def test_worker_record_and_launch_logging(tmp_path):
         c = Path(f).read_text()
         assert "@record\ndef main():" in c
         compile(c, f, "exec")
-        assert "--log-dir" in cmd and "--tee" in cmd
-        assert d.ddp_log_dir
+        if TORCH_1_9:
+            assert "--log-dir" in cmd
+            assert ("--tee" in cmd) is not MACOS
+            assert d.ddp_log_dir
+        else:
+            assert "--log-dir" not in cmd and "--tee" not in cmd
+            assert d.ddp_log_dir is None
     finally:
         Path(f).unlink(missing_ok=True)
 
@@ -32,3 +40,10 @@ def test_collect_error_logs(tmp_path):
     (p / "stderr.log").write_text("TRACE_MARKER")
     out = collect_ddp_error_logs(tmp_path)
     assert "ROOT_MARKER" in out and "TRACE_MARKER" in out
+
+
+def test_windows_ddp_launch_disables_libuv(monkeypatch):
+    monkeypatch.setattr(dist_utils, "WINDOWS", True)
+    monkeypatch.delenv("USE_LIBUV", raising=False)
+
+    assert ddp_launch_env()["USE_LIBUV"] == "0"

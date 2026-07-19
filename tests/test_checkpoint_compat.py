@@ -15,6 +15,7 @@ from ultralytics.utils.checkpoint_compat import (
     load_compatible_checkpoint,
     remap_checkpoint_state,
 )
+from ultralytics.utils.patches import torch_load
 
 
 class ToyHead(nn.Module):
@@ -83,7 +84,7 @@ def test_full_checkpoint_conversion_is_read_only_and_preserves_graph(tmp_path):
     before = _sha256(source)
 
     report = convert_checkpoint_artifact(source, destination)
-    converted = torch.load(destination, map_location="cpu", weights_only=False)
+    converted = torch_load(destination, map_location="cpu", weights_only=False)
 
     assert _sha256(source) == before
     assert report.source_version == "8.3.240"
@@ -115,7 +116,7 @@ def test_conversion_rebuilds_online_and_ema_state(tmp_path):
 
     target = ToyModel()
     convert_checkpoint_artifact(source, destination, target_model=target)
-    converted = torch.load(destination, map_location="cpu", weights_only=False)
+    converted = torch_load(destination, map_location="cpu", weights_only=False)
 
     assert torch.equal(converted["model"].model[0].weight, torch.full_like(target.model[0].weight, 3))
     assert torch.equal(converted["ema"].model[0].weight, torch.full_like(target.model[0].weight, 3))
@@ -148,7 +149,7 @@ def test_molora_checkpoint_conversion_and_inspection(tmp_path):
     report = inspect_checkpoint_artifact(source)
     assert report.artifact_type == "molora_adapter"
     convert_checkpoint_artifact(source, destination)
-    payload = torch.load(destination, map_location="cpu", weights_only=False)
+    payload = torch_load(destination, map_location="cpu", weights_only=False)
     assert payload["format"] == "molora_adapter"
     assert payload["target_version"] == "8.4.101"
 

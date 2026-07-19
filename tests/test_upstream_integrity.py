@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
-from tools.migration.check_upstream_integrity import UPSTREAM_COMMIT, verify_manifest
+import pytest
+
+from tools.migration import check_upstream_integrity
+from tools.migration.check_upstream_integrity import UPSTREAM_COMMIT, _sha256_lf, verify_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "docs/governance/upstream-v8.4.101-manifest.json"
@@ -17,6 +21,20 @@ def test_upstream_manifest_matches_official_tag():
     assert data["upstream"]["commit"] == UPSTREAM_COMMIT
     assert data["counts"] == {"backends": 19, "export_modules": 17, "yolo26_configs": 10}
     assert not verify_manifest(data)
+
+
+def test_upstream_manifest_verification_does_not_require_local_tag(monkeypatch):
+    data = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    monkeypatch.setattr(check_upstream_integrity, "_git_commit", lambda _: pytest.fail("tag lookup is not allowed"))
+
+    assert not verify_manifest(data)
+
+
+def test_upstream_hash_normalizes_windows_checkout_line_endings(tmp_path):
+    path = tmp_path / "protected.py"
+    path.write_bytes(b"first\r\nsecond\r\n")
+
+    assert _sha256_lf(path) == hashlib.sha256(b"first\nsecond\n").hexdigest()
 
 
 def test_upstream_manifest_protects_yolo26_and_export_paths():

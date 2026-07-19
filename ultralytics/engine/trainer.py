@@ -52,7 +52,7 @@ from ultralytics.utils import (
 )
 from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
-from ultralytics.utils.dist import collect_ddp_error_logs, ddp_cleanup, generate_ddp_command
+from ultralytics.utils.dist import collect_ddp_error_logs, ddp_cleanup, ddp_launch_env, generate_ddp_command
 from ultralytics.utils.files import get_latest_run
 from ultralytics.utils.plotting import plot_results
 from ultralytics.utils.torch_utils import (
@@ -284,7 +284,7 @@ class BaseTrainer:
             try:
                 cmd, file = generate_ddp_command(self)
                 LOGGER.info(f"{colorstr('DDP:')} debug command {' '.join(cmd)}")
-                subprocess.run(cmd, check=True)
+                subprocess.run(cmd, check=True, env=ddp_launch_env())
             except subprocess.CalledProcessError as e:
                 worker_errors = collect_ddp_error_logs(getattr(self, "ddp_log_dir", ""))
                 if worker_errors:

@@ -16,6 +16,7 @@ from torch import nn
 
 from ultralytics import __version__
 from ultralytics.utils import GIT, LOGGER
+from ultralytics.utils.patches import torch_load
 from ultralytics.utils.torch_utils import TORCH_2_4, convert_optimizer_state_dict_to_fp16, unwrap_model
 
 
@@ -170,14 +171,16 @@ class TrainingRecoveryController:
             stride = max(1, int(torch.as_tensor(getattr(model, "stride", torch.tensor([32.0]))).max().item()))
             configured = getattr(getattr(self.trainer, "args", None), "imgsz", 64)
             configured = max(configured) if isinstance(configured, (list, tuple)) else configured
-            imgsz = math.ceil(max(32, min(int(configured), 64)) / stride) * stride
+            is_rtdetr = any(module.__class__.__name__ == "RTDETRDecoder" for module in model.modules())
+            smoke_min, smoke_max = (128, 128) if is_rtdetr else (32, 64)
+            imgsz = math.ceil(max(smoke_min, min(int(configured), smoke_max)) / stride) * stride
             first = next(model.parameters(), None)
             sample = (
                 torch.zeros(1, first.shape[1], dtype=torch.float32)
                 if not yaml and first is not None and first.ndim == 2
                 else torch.zeros(1, channels, imgsz, imgsz, dtype=torch.float32)
             )
-            with torch.inference_mode():
+            with torch.no_grad():
                 for index, smoke_input in enumerate(
                     (sample, torch.linspace(-1.0, 1.0, sample.numel(), dtype=torch.float32).reshape_as(sample))
                 ):
@@ -190,7 +193,7 @@ class TrainingRecoveryController:
     def validate_artifact(self, path) -> tuple[bool, str]:
         """Verify that a checkpoint is readable, finite, and executable."""
         try:
-            checkpoint = torch.load(Path(path), map_location="cpu", weights_only=False)
+            checkpoint = torch_load(Path(path), map_location="cpu", weights_only=False)
         except (OSError, RuntimeError, ValueError, EOFError, pickle.UnpicklingError) as exc:
             return False, f"unreadable checkpoint: {type(exc).__name__}: {exc}"
         if not isinstance(checkpoint, dict) or not self.state_is_finite(checkpoint):
@@ -220,7 +223,7 @@ class TrainingRecoveryController:
     def save_healthy(self, serialized_checkpoint: bytes) -> bool:
         """Atomically replace the recovery checkpoint only with finite executable state."""
         trainer = self.trainer
-        checkpoint = torch.load(io.BytesIO(serialized_checkpoint), map_location="cpu", weights_only=False)
+        checkpoint = torch_load(io.BytesIO(serialized_checkpoint), map_location="cpu", weights_only=False)
         if not self.state_is_finite(checkpoint):
             LOGGER.warning("Skipping non-finite recovery checkpoint state.")
             return False
@@ -291,7 +294,7 @@ class TrainingRecoveryController:
         payload = None
         if rank in {-1, 0} and path is not None and Path(path).exists():
             try:
-                candidate = torch.load(path, map_location="cpu", weights_only=False)
+                candidate = torch_load(path, map_location="cpu", weights_only=False)
                 if self.state_is_finite(candidate):
                     payload = Path(path).read_bytes()
             except (OSError, RuntimeError, ValueError, EOFError, pickle.UnpicklingError):
@@ -306,7 +309,7 @@ class TrainingRecoveryController:
         trainer.nan_recovery_attempts += 1
         if trainer.nan_recovery_attempts > 3:
             raise RuntimeError(f"Training failed: NaN persisted for {trainer.nan_recovery_attempts} epochs")
-        checkpoint = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
+        checkpoint = torch_load(io.BytesIO(payload), map_location="cpu", weights_only=False)
         snapshot = checkpoint.get("model")
         if snapshot is None:
             raise RuntimeError("Healthy checkpoint lacks online model state; refusing to restore EMA with optimizer state.")

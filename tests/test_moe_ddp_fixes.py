@@ -3,8 +3,10 @@
 import ast
 from pathlib import Path
 
-S = (Path(__file__).parents[1] / "ultralytics/engine/trainer.py").read_text()
-V06 = (Path(__file__).parents[1] / "ultralytics/cfg/models/master/v0_6/det/yolo-master-n.yaml").read_text()
+S = (Path(__file__).parents[1] / "ultralytics/engine/trainer.py").read_text(encoding="utf-8")
+V06 = (Path(__file__).parents[1] / "ultralytics/cfg/models/master/v0_6/det/yolo-master-n.yaml").read_text(
+    encoding="utf-8"
+)
 
 
 def test_syntax():

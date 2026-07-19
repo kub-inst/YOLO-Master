@@ -1089,7 +1089,7 @@ def attempt_compile(
             dummy = dummy.half()
         t1 = time.perf_counter()
         try:
-            with torch.inference_mode():
+            with torch.no_grad():
                 if use_autocast and device.type in {"cuda", "mps"}:
                     with torch.autocast(device.type):
                         _ = model(dummy)

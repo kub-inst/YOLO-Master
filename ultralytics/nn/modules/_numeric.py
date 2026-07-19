@@ -39,13 +39,17 @@ def fp_clamp_floor(value: float, dtype: torch.dtype) -> float:
 
 def clamp_min_for_dtype(tensor: torch.Tensor, value: float = 1e-6) -> torch.Tensor:
     """Clamp with a floor that remains effective under fp16 and bf16 AMP."""
-    return tensor.clamp_min(fp_clamp_floor(value, tensor.dtype))
+    dtype = tensor.dtype
+    work = tensor.float() if tensor.device.type == "cpu" and dtype in {torch.float16, torch.bfloat16} else tensor
+    return work.clamp_min(fp_clamp_floor(value, dtype)).to(dtype)
 
 
 def stable_normalize(tensor: torch.Tensor, dim: int, eps: float = 1e-6) -> torch.Tensor:
     """Normalize along ``dim`` without allowing a low-precision zero denominator."""
-    denominator = clamp_min_for_dtype(tensor.sum(dim=dim, keepdim=True), eps)
-    return tensor / denominator
+    dtype = tensor.dtype
+    work = tensor.float() if tensor.device.type == "cpu" and dtype in {torch.float16, torch.bfloat16} else tensor
+    denominator = work.sum(dim=dim, keepdim=True).clamp_min(fp_clamp_floor(eps, dtype))
+    return (work / denominator).to(dtype)
 
 
 def all_reduce_mean(tensor: torch.Tensor) -> torch.Tensor:
