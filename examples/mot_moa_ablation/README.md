@@ -47,24 +47,24 @@ LocalConv   Window      Deformable
 | `yolo-master-moa-n.yaml` | MoE | C2fMoA | — | ✅ (×6) | **MoA 对比组** |
 | `yolo-master-moa-mot-n.yaml` | MoE | C2fMoA + C2fMoT | ✅ (×6) | ✅ (×1) | **MoA+MoT 混合** |
 
-### 实测参数与性能对比 (RTX 5070 Ti, imgsz=640)
+### 实测参数与性能对比 (RTX 5070 Ti, imgsz=640, warmup=5, reps=20)
 
 | 模型 | Params | GFLOPs | GPU P50 | CPU P50 | MoT Block | MoA Block |
 |:---|---:|---:|---:|---:|---:|---:|
-| MoE 基线 | 3.45M | 8.03 | 23.3 ms | 51.7 ms | — | — |
-| MoA | 3.58M (+3.7%) | 8.30 (+3.4%) | 34.8 ms | 67.7 ms | — | 6 |
-| MoT | 4.06M (+17.6%) | 11.31 (+40.9%) | 42.4 ms | 184.1 ms | 6 | — |
-| MoA+MoT | 4.06M (+17.6%) | 11.31 (+40.9%) | 47.2 ms | 176.8 ms | 6 | 1 |
+| MoE 基线 | 3.45M | 8.03 | 19.6 ms | 51.7 ms | — | — |
+| MoA | 3.58M (+3.7%) | 8.30 (+3.4%) | 29.4 ms | 67.7 ms | — | 6 |
+| MoT | 4.06M (+17.6%) | 8.76 (+9.1%) | 35.2 ms | 184.1 ms | 6 | — |
+| MoA+MoT | 4.06M (+17.6%) | 8.76 (+9.1%) | 39.4 ms | 176.8 ms | 6 | 1 |
 
-> **分析：** GPU 上 MoT 开销合理（+82% latency vs +256% on CPU）。MoA 开销最温和（+49% GPU）。混合架构 MoA+MoT 延迟与纯 MoT 接近。
+> GPU 上 MoT 开销约 1.8x MoE，远好于 CPU 的 3.6x。MoA 开销 1.5x，混合 MoA+MoT 约 2.0x。FLOPs 通过 thop 计算。
 
 ### 实测训练结果 (VisDrone 30 epochs, AdamW, from scratch)
 
 | 模型 | mAP50 | mAP50-95 | Params | GPU P50 | 训练稳定性 |
 |:---|---:|---:|---:|---:|:---:|
-| MoE 基线 | **0.254** | 0.142 | 3.45M | 23.3 ms | ✅ |
-| MoT | 0.251 | 0.141 | 4.06M | 42.4 ms | ✅ |
-| MoA | 0.248 | 0.141 | 3.58M | 34.8 ms | ✅ |
+| MoE 基线 | **0.254** | 0.142 | 3.45M | 19.6 ms | ✅ |
+| MoT | 0.251 | 0.141 | 4.06M | 35.2 ms | ✅ |
+| MoA | 0.248 | 0.141 | 3.58M | 29.4 ms | ✅ |
 
 > **分析：** 30 epochs 下三者 mAP 接近（<3% 差异），说明短时训练中架构差异尚未充分体现。
 > 参考：EsMoE-N 在 VisDrone 上训练 300 epochs (SGD) 可达到 mAP50-95=0.203（见 `scripts/reproduce/README.md`）。
@@ -90,7 +90,7 @@ LocalConv   Window      Deformable
 |:--|:---|:---|
 | 1 | **密集航拍小目标 → MoT** | DeformableTransformer 激活率在 VisDrone 上 +94%（20.7%→40.1%），架构天然适配密集/不规则目标 |
 | 2 | **通用检测/服务器 → MoE 基线** | 30 epochs mAP 三者持平（0.14），MoE 延迟最低（23.3ms GPU / 52ms CPU）、参数最少（3.45M） |
-| 3 | **大规模训练 (300+ epochs) → MoE** | 已有 benchmark 证明 EsMoE-N 在 VisDrone 300 epochs 达 mAP50-95=0.203，MoA/MoT 缺乏同等规模对比数据 |
+| 3 | **大规模训练 (300+ epochs) → MoE** | 已有 benchmark 证明 EsMoE-N 在 VisDrone 300 epochs 达 mAP50-95=0.203；MoE 延迟最低（GPU 19.6ms / CPU 52ms） |
 
 ### 训练命令
 
