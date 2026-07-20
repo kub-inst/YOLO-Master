@@ -136,6 +136,10 @@ class LoRAConfig:
 
     # Planner integration
     planner_enabled: bool = False  # Enable architecture-conditioned PEFT Planner
+    # Maximum adapter parameter count for the paper's budgeted placement stage.
+    # None preserves legacy unlimited-target behavior when the planner is off.
+    adapter_budget: Optional[int] = None
+    planner_solver: str = "ao"  # ao, dco, mip; AO is deterministic/default
 
     def __post_init__(self):
         """Performs parameter validation and type standardization."""
@@ -277,6 +281,8 @@ class LoRAConfig:
             "few_shot_hook_cache": "lora_few_shot_hook_cache",
             # Planner integration
             "planner_enabled": "lora_planner_enabled",
+            "adapter_budget": "lora_adapter_budget",
+            "planner_solver": "lora_planner_solver",
         }
 
         dataclass_fields = set(cls.__dataclass_fields__)

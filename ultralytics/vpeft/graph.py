@@ -427,6 +427,13 @@ class ComputationGraphBuilder:
         """Describe YOLO26 branches and routed ancestors without relying on numeric path names."""
         ancestors = cls._ancestors(name, root)
         ancestor_names = [module.__class__.__name__ for module in ancestors]
+        current = cls._get_submodule(root, name) if name else root
+        current_name = current.__class__.__name__
+        text_classes = {
+            "WorldModel", "WorldDetect", "MaxSigmoidAttnBlock", "ImagePoolingAttn",
+            "ContrastiveHead", "BNContrastiveHead", "TextFusion", "WorldEmbed",
+            "TextProj", "TextEncoder",
+        }
         head_classes = {
             "Detect",
             "Segment",
@@ -456,6 +463,7 @@ class ComputationGraphBuilder:
         }
         lname = name.lower()
         in_head = any(class_name in head_classes for class_name in ancestor_names)
+        text_fusion = current_name in text_classes or any(class_name in text_classes for class_name in ancestor_names)
         branch = None
         for value in ("one2one", "one2many", "proto", "cv4", "cv5", "lrpc"):
             if value in lname:
@@ -471,6 +479,7 @@ class ComputationGraphBuilder:
             "head_family": next((name for name in reversed(ancestor_names) if name in head_classes), None),
             "head_branch": branch,
             "in_head": in_head,
+            "text_fusion": text_fusion,
             "shared_backbone": not in_head,
             "dynamic_routing": dynamic_routing,
             "merge_semantics": "dynamic_router" if dynamic_routing else "exact",
@@ -551,6 +560,8 @@ class ComputationGraphBuilder:
             sigma_i = (
                 _SEMANTIC_ROLE_VOCAB["head"]
                 if annotations["in_head"]
+                else _SEMANTIC_ROLE_VOCAB["text_fusion"]
+                if annotations.get("text_fusion")
                 else self._infer_semantic_role(name)
             )
 

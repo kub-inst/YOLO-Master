@@ -154,6 +154,8 @@ lora_bias: "none" # (str) LoRA bias type: "none", "all", "lora_only"
 lora_backend: "auto" # (str) LoRA backend: "auto", "peft", "fallback"
 lora_variant: "lora" # (str) Adapter variant: "lora", "loha", "dora"
 lora_planner_enabled: False # (bool) Enable architecture-conditioned PEFT Planner for automatic variant/rank selection (opt-in, backward compatible)
+lora_adapter_budget: # (int, optional) Maximum adapter parameters for planner placement
+lora_planner_solver: "ao" # (str) Planner budget solver: ao, dco, mip
 lora_include_head: False # (bool) Include YOLO detection head layers in LoRA targeting
 lora_freeze_bn: False # (bool) Freeze BatchNorm layers during LoRA training
 lora_target_modules: # (list[str], optional) LoRA target modules

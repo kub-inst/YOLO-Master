@@ -27,6 +27,7 @@ __all__ = [
     "VariantModuleCompatibilityConstraint",
     "MoEConsistencyConstraint",
     "DivisibilityConstraint",
+    "CandidateTargetConstraint",
     "ConstraintRegistry",
 ]
 
@@ -249,7 +250,6 @@ class SemanticProtectionConstraint(Constraint):
     _ALWAYS_PROTECTED = {
         "dfl",
         "msdeformattn",
-        "text_fusion",
         "stem",
         "focus",
     }
@@ -269,6 +269,12 @@ class SemanticProtectionConstraint(Constraint):
     def is_feasible(self, node_info: NodeInfo, variant: str, rank: int) -> bool:
         role = node_info.semantic_role.lower()
         name = node_info.name.lower()
+
+        # Text-fusion is a valid semantic target only for variants with the
+        # paper's text-side parameterization; plain LoRA is adapted to LoHa by
+        # the planner before the budget solver runs.
+        if role == "text_fusion" and variant.lower() not in {"loha", "ia3"}:
+            return False
 
         # Always-protected roles
         if role in self._ALWAYS_PROTECTED:
@@ -290,6 +296,17 @@ class SemanticProtectionConstraint(Constraint):
             return False
 
         return True
+
+
+class CandidateTargetConstraint(Constraint):
+    """Hard constraint limiting placement to the planner's candidate set."""
+
+    def __init__(self, candidates: Optional[Iterable[str]] = None, weight: float = 1.0):
+        super().__init__("C_candidates", weight)
+        self.candidates = {str(name) for name in (candidates or [])}
+
+    def is_feasible(self, node_info: NodeInfo, variant: str, rank: int) -> bool:
+        return not self.candidates or node_info.name in self.candidates
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +684,9 @@ class ConstraintRegistry:
         registry._register(MoEConsistencyConstraint(
             epsilon=cfg.get("moe_epsilon", 4)), as_hard=True)
         registry._register(DivisibilityConstraint(), as_hard=True)
+        candidates = cfg.get("candidate_targets")
+        if candidates:
+            registry._register(CandidateTargetConstraint(candidates), as_hard=True)
         return registry
 
     # -- legacy interface (required by policy.py & solver.py) --

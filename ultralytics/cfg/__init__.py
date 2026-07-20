@@ -306,6 +306,7 @@ MIXTURE_INT_KEYS = frozenset(
         "lora_tfinal",
         "lora_tinit",
         "lora_total_step",
+        "lora_adapter_budget",
         "moa_local_window_size",
         "moe_expert_warmup_epochs",
         "moe_map_saturation_window_size",
@@ -429,6 +430,7 @@ MIXTURE_STR_KEYS = frozenset(
         "lora_quantization",
         "lora_type",
         "lora_variant",
+        "lora_planner_solver",
         "molora_expert_init",
         "molora_router_type",
     }

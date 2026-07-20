@@ -32,6 +32,7 @@ from .constraints import (
     VariantModuleCompatibilityConstraint,
     MoEConsistencyConstraint,
     DivisibilityConstraint,
+    CandidateTargetConstraint,
 )
 from .policy import (
     PlacementPolicy,
@@ -71,6 +72,7 @@ __all__ = [
     "VariantModuleCompatibilityConstraint",
     "MoEConsistencyConstraint",
     "DivisibilityConstraint",
+    "CandidateTargetConstraint",
     # Policy
     "PlacementPolicy",
     "RankAllocator",
