@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ultralytics.nn.modules._numeric import all_reduce_mean, fp_clamp_floor
 from ultralytics.nn.modules.moa._constants import DEFAULT_MIN_TEMPERATURE, DEFAULT_TEMPERATURE_ANNEAL_FACTOR, ROUTER_ENTROPY_FLOOR, ROUTER_LOGIT_LIMIT, ROUTER_Z_LOSS_LIMIT
+from ultralytics.nn.modules.routing_protocol import graph_connected_finite_zero
+from ultralytics.nn.modules.routing_protocol import routing_finite_diagnostics
 from ultralytics.nn.modules.utils import get_safe_groups as _safe_groups
 
 _all_reduce_mean = all_reduce_mean
@@ -52,7 +54,8 @@ def _moa_router_aux_loss(
     coeff: float,
     *,
     reduce_ddp: bool = False,
-) -> torch.Tensor:
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict]:
     """GShard-scale MoA regularization with exact DDP global-value/local-gradient semantics.
 
     Uses the shared numerical all-reduce helper (including NCCL CPU-tensor safety) for the
@@ -90,10 +93,11 @@ def _moa_router_aux_loss(
     # Lower entropy weight (0.01) avoids over-constraining the router toward
     # uniform mixing when balance_loss already encourages load balance.
     result = coeff * (balance_loss + 0.1 * z_loss + 0.01 * entropy_deficit)
+    diagnostics = routing_finite_diagnostics(logits=logits, probabilities=weights, aux_loss=result)
     # Final safety: prevent Inf/NaN aux_loss from poisoning the total loss
     if not torch.isfinite(result):
-        return weights.new_zeros(())
-    return result
+        result = graph_connected_finite_zero(weights, logits, result)
+    return (result, diagnostics) if return_diagnostics else result
 
 def anneal_moa_temperature(
     model: nn.Module,

@@ -11,6 +11,7 @@ Covers features added in the optimization pass:
 import json
 
 import pytest
+import torch
 import torch.nn as nn
 from torch.nn.parallel import DataParallel
 
@@ -18,6 +19,7 @@ from ultralytics.utils.lora.planner import (
     ArchitectureFingerprint,
     DecisionAudit,
     PEFTPlanner,
+    PEFTVariantProfile,
     PlacementDecision,
     _fingerprint_cache,
 )
@@ -362,7 +364,67 @@ class TestPlannerCalibrationGates:
         assert metadata["calibration_fitted"] is True
         assert metadata["calibration_n_samples"] == 10
         assert 0 < metadata["calibration_effective_rank"] <= metadata["calibration_n_features"]
+        assert metadata["calibration_regularization"] > 0
+        assert metadata["calibration_condition_number"] >= 1
+        assert metadata["calibration_noise_variance"] >= 0
+        assert metadata["calibration_effective_dof"] > 0
+        assert metadata["calibration_rank_deficient"] is True
+        assert metadata["calibration_posterior_available"] is True
         assert metadata["low_confidence"] is True
+
+    def test_rank_deficient_large_dataset_remains_low_confidence(self):
+        planner = PEFTPlanner()
+        planner.fit(self._history(30))
+
+        metadata = planner._calibration_metadata()
+        assert metadata["calibration_n_samples"] == 30
+        assert metadata["calibration_rank_deficient"] is True
+        assert metadata["low_confidence"] is True
+
+    def test_rank_deficient_fit_shrinks_unobserved_features_to_prior(self):
+        planner = PEFTPlanner()
+        planner.fit(self._history())
+
+        assert all(abs(value) < 1e-12 for value in planner._coeffs[5:10])
+        assert all(torch.isfinite(torch.tensor(planner._coeffs)))
+
+    def test_identifiable_signal_is_preserved_by_prior_centered_ridge(self):
+        history = []
+        for i in range(40):
+            phi_attn = i / 50.0
+            fingerprint = ArchitectureFingerprint(phi_attn=phi_attn, phi_width=0.4 + 0.1 * (i % 3))
+            delta = 0.04 - 0.2 * phi_attn + PEFTVariantProfile.from_variant("lora").xi
+            history.append((fingerprint, "lora", delta))
+
+        planner = PEFTPlanner()
+        planner.fit(history)
+
+        assert planner._coeffs[1] == pytest.approx(-0.2, abs=0.03)
+
+    def test_posterior_uncertainty_grows_off_distribution(self):
+        history = [
+            (
+                ArchitectureFingerprint(
+                    phi_attn=0.18 + (i % 5) * 0.01,
+                    phi_width=0.45 + (i % 3) * 0.01,
+                    phi_depth=0.35 + (i % 2) * 0.01,
+                ),
+                "lora",
+                0.06 - 0.03 * (i % 5) * 0.01,
+            )
+            for i in range(30)
+        ]
+        planner = PEFTPlanner()
+        planner.fit(history)
+
+        _, near_uncertainty = planner.predict_with_uncertainty(
+            ArchitectureFingerprint(phi_attn=0.2, phi_width=0.46, phi_depth=0.35), "lora"
+        )
+        _, far_uncertainty = planner.predict_with_uncertainty(
+            ArchitectureFingerprint(phi_attn=0.9, phi_width=1.0, phi_depth=1.0), "lora"
+        )
+
+        assert far_uncertainty > near_uncertainty
 
     def test_small_fitted_dataset_downgrades_accept_to_adapt(self):
         from ultralytics.utils.lora.config import LoRAConfig

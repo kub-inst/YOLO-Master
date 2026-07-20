@@ -32,6 +32,7 @@ from .constraints import (
     VariantModuleCompatibilityConstraint,
     MoEConsistencyConstraint,
     DivisibilityConstraint,
+    CandidateTargetConstraint,
 )
 from .policy import (
     PlacementPolicy,
@@ -39,6 +40,7 @@ from .policy import (
     SoftRankAllocator,
     GreedyRankAllocator,
     RLRankAllocator,
+    PPORankTrajectory,
     HybridTrainingProtocol,
     SEMANTIC_UTILITY,
     RANK_SET,
@@ -70,12 +72,14 @@ __all__ = [
     "VariantModuleCompatibilityConstraint",
     "MoEConsistencyConstraint",
     "DivisibilityConstraint",
+    "CandidateTargetConstraint",
     # Policy
     "PlacementPolicy",
     "RankAllocator",
     "SoftRankAllocator",
     "GreedyRankAllocator",
     "RLRankAllocator",
+    "PPORankTrajectory",
     "HybridTrainingProtocol",
     "SEMANTIC_UTILITY",
     "RANK_SET",

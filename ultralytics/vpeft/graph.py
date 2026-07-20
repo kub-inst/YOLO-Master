@@ -427,6 +427,13 @@ class ComputationGraphBuilder:
         """Describe YOLO26 branches and routed ancestors without relying on numeric path names."""
         ancestors = cls._ancestors(name, root)
         ancestor_names = [module.__class__.__name__ for module in ancestors]
+        current = cls._get_submodule(root, name) if name else root
+        current_name = current.__class__.__name__
+        text_classes = {
+            "WorldModel", "WorldDetect", "MaxSigmoidAttnBlock", "ImagePoolingAttn",
+            "ContrastiveHead", "BNContrastiveHead", "TextFusion", "WorldEmbed",
+            "TextProj", "TextEncoder",
+        }
         head_classes = {
             "Detect",
             "Segment",
@@ -456,6 +463,7 @@ class ComputationGraphBuilder:
         }
         lname = name.lower()
         in_head = any(class_name in head_classes for class_name in ancestor_names)
+        text_fusion = current_name in text_classes or any(class_name in text_classes for class_name in ancestor_names)
         branch = None
         for value in ("one2one", "one2many", "proto", "cv4", "cv5", "lrpc"):
             if value in lname:
@@ -466,14 +474,32 @@ class ComputationGraphBuilder:
             or any(token in class_name.lower() for token in ("moe", "router", "expert", "molora"))
             for class_name in ancestor_names
         )
+        moe_group = ""
+        # A standalone MoE container may expose ``num_experts`` on the root
+        # module, while the expert leaves are named ``experts.<idx>`` and have
+        # no intermediate MoE ancestor.
+        if int(getattr(root, "num_experts", 0) or 0) > 0 and "experts." in name.lower():
+            moe_group = name.split(".experts.", 1)[0] if ".experts." in name else "experts"
+        for depth, ancestor in enumerate(ancestors):
+            if int(getattr(ancestor, "num_experts", 0) or 0) <= 0:
+                continue
+            prefix = ".".join(name.split(".")[: depth + 1])
+            relative = name[len(prefix):].lstrip(".").lower()
+            if relative.startswith("experts.") or ".experts." in relative or "expert" in relative:
+                moe_group = prefix
+                break
+        if moe_group:
+            text_fusion = False
         return {
             "ancestor_classes": ancestor_names,
             "head_family": next((name for name in reversed(ancestor_names) if name in head_classes), None),
             "head_branch": branch,
             "in_head": in_head,
+            "text_fusion": text_fusion,
             "shared_backbone": not in_head,
             "dynamic_routing": dynamic_routing,
             "merge_semantics": "dynamic_router" if dynamic_routing else "exact",
+            "moe_group": moe_group,
         }
 
     @staticmethod
@@ -551,6 +577,8 @@ class ComputationGraphBuilder:
             sigma_i = (
                 _SEMANTIC_ROLE_VOCAB["head"]
                 if annotations["in_head"]
+                else _SEMANTIC_ROLE_VOCAB["text_fusion"]
+                if annotations.get("text_fusion")
                 else self._infer_semantic_role(name)
             )
 

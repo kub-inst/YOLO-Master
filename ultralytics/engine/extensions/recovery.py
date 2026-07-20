@@ -220,17 +220,35 @@ class TrainingRecoveryController:
         paths, rejected = decision or ([], ["rank 0 did not provide a checkpoint decision"])
         return [Path(path) for path in paths], rejected
 
-    def save_healthy(self, serialized_checkpoint: bytes) -> bool:
-        """Atomically replace the recovery checkpoint only with finite executable state."""
+    def save_healthy(
+        self,
+        serialized_checkpoint: bytes,
+        *,
+        state_verified: bool | None = None,
+        verify_forward: bool = False,
+    ) -> bool:
+        """Atomically replace the recovery checkpoint after a finite-state health check.
+
+        Epoch checkpoints are already serialized by the caller. Re-loading a full
+        checkpoint and running CPU inference here makes every epoch wait on disk
+        serialization and a second model copy. The online model/EMA/optimizer
+        state is checked before serialization instead. A forward smoke test is
+        retained for the startup recovery point and final artifact validation.
+        """
         trainer = self.trainer
-        checkpoint = torch_load(io.BytesIO(serialized_checkpoint), map_location="cpu", weights_only=False)
-        if not self.state_is_finite(checkpoint):
+        if state_verified is None:
+            # Preserve the byte-artifact validation path for direct callers.
+            checkpoint = torch_load(io.BytesIO(serialized_checkpoint), map_location="cpu", weights_only=False)
+            state_verified = self.state_is_finite(checkpoint)
+        if not state_verified:
             LOGGER.warning("Skipping non-finite recovery checkpoint state.")
             return False
-        healthy, reason = self.checkpoint_forward_smoke(checkpoint)
-        if not healthy:
-            LOGGER.warning(f"Skipping recovery checkpoint that failed inference health check: {reason}")
-            return False
+        if verify_forward:
+            checkpoint = torch_load(io.BytesIO(serialized_checkpoint), map_location="cpu", weights_only=False)
+            healthy, reason = self.checkpoint_forward_smoke(checkpoint)
+            if not healthy:
+                LOGGER.warning(f"Skipping recovery checkpoint that failed inference health check: {reason}")
+                return False
         trainer.healthy.parent.mkdir(parents=True, exist_ok=True)
         temporary = trainer.healthy.with_suffix(".tmp")
         temporary.write_bytes(serialized_checkpoint)
@@ -255,7 +273,7 @@ class TrainingRecoveryController:
                 healthy = all(
                     self.state_is_finite(state)
                     for state in (unwrap_model(trainer.model), trainer.optimizer.state_dict(), trainer.scaler.state_dict())
-                ) and trainer._save_healthy_checkpoint(trainer._serialize_checkpoint())
+                ) and trainer._save_healthy_checkpoint(trainer._serialize_checkpoint(), verify_forward=True)
             except (OSError, RuntimeError, ValueError) as exc:
                 LOGGER.warning(f"Initial healthy checkpoint creation failed: {exc}")
                 healthy = False

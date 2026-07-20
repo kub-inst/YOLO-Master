@@ -27,6 +27,7 @@ __all__ = [
     "VariantModuleCompatibilityConstraint",
     "MoEConsistencyConstraint",
     "DivisibilityConstraint",
+    "CandidateTargetConstraint",
     "ConstraintRegistry",
 ]
 
@@ -52,6 +53,7 @@ class NodeInfo:
         self.groups: int = self._extract("groups", default=1)
         self.kernel_size: Union[int, Tuple[int, int]] = self._extract("kernel_size", default=(1, 1))
         self.semantic_role: str = self._extract("semantic_role", "sigma_i", default="other")
+        self.moe_group: str = self._extract("moe_group", default="")
         self.module: Optional[nn.Module] = self._extract_module()
 
         # Normalise operator_type from GraphNode tau_i
@@ -92,6 +94,7 @@ class NodeInfo:
             sigma = getattr(obj.attributes, "sigma_i", 10)
             if self.semantic_role in ("", "other"):
                 self.semantic_role = sigma_map.get(sigma, "other")
+            self.moe_group = str((getattr(obj, "annotations", {}) or {}).get("moe_group", self.moe_group) or "")
             # kernel_size from k_i
             k_i = getattr(obj.attributes, "k_i", 1)
             if k_i > 0 and self.kernel_size == (1, 1):
@@ -249,7 +252,6 @@ class SemanticProtectionConstraint(Constraint):
     _ALWAYS_PROTECTED = {
         "dfl",
         "msdeformattn",
-        "text_fusion",
         "stem",
         "focus",
     }
@@ -269,6 +271,12 @@ class SemanticProtectionConstraint(Constraint):
     def is_feasible(self, node_info: NodeInfo, variant: str, rank: int) -> bool:
         role = node_info.semantic_role.lower()
         name = node_info.name.lower()
+
+        # Text-fusion is a valid semantic target only for variants with the
+        # paper's text-side parameterization; plain LoRA is adapted to LoHa by
+        # the planner before the budget solver runs.
+        if role == "text_fusion" and variant.lower() not in {"loha", "ia3"}:
+            return False
 
         # Always-protected roles
         if role in self._ALWAYS_PROTECTED:
@@ -290,6 +298,17 @@ class SemanticProtectionConstraint(Constraint):
             return False
 
         return True
+
+
+class CandidateTargetConstraint(Constraint):
+    """Hard constraint limiting placement to the planner's candidate set."""
+
+    def __init__(self, candidates: Optional[Iterable[str]] = None, weight: float = 1.0):
+        super().__init__("C_candidates", weight)
+        self.candidates = {str(name) for name in (candidates or [])}
+
+    def is_feasible(self, node_info: NodeInfo, variant: str, rank: int) -> bool:
+        return not self.candidates or node_info.name in self.candidates
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +530,15 @@ class MoEConsistencyConstraint(Constraint):
     def reset(self) -> None:
         self.registered_experts.clear()
 
+    def check_group_ranks(self, infos: List[NodeInfo], variant: str, ranks: List[int], epsilon: int | None = None) -> bool:
+        """Validate a graph-discovered expert group without mutable registration."""
+        if len(infos) < 2:
+            return True
+        eps = self.epsilon if epsilon is None else int(epsilon)
+        if any(info.semantic_role != "MoE_expert" for info in infos):
+            return True
+        return len(ranks) == len(infos) and max(ranks) - min(ranks) <= eps
+
 
 # ---------------------------------------------------------------------------
 # 7. DivisibilityConstraint (C_div)
@@ -667,6 +695,9 @@ class ConstraintRegistry:
         registry._register(MoEConsistencyConstraint(
             epsilon=cfg.get("moe_epsilon", 4)), as_hard=True)
         registry._register(DivisibilityConstraint(), as_hard=True)
+        candidates = cfg.get("candidate_targets")
+        if candidates:
+            registry._register(CandidateTargetConstraint(candidates), as_hard=True)
         return registry
 
     # -- legacy interface (required by policy.py & solver.py) --
@@ -693,7 +724,67 @@ class ConstraintRegistry:
             node_info = self._node_info_from_graph(graph, i)
             if not any(self.check_hard(node_info, variant, rank=rank) for rank in ranks):
                 mask[i] = False
+
+        # Enforce expert homogeneity from graph annotations.  This removes the
+        # old requirement for callers to manually call register_expert().
+        if self._moe_constraint is not None:
+            groups: Dict[str, List[int]] = {}
+            for i in range(graph.n_nodes):
+                info = self._node_info_from_graph(graph, i)
+                if info.semantic_role == "MoE_expert" and info.moe_group:
+                    groups.setdefault(info.moe_group, []).append(i)
+            for indices in groups.values():
+                if len(indices) < 2:
+                    continue
+                feasible_sets = []
+                for i in indices:
+                    info = self._node_info_from_graph(graph, i)
+                    feasible_sets.append({
+                        rank for rank in ranks
+                        if all(
+                            c.is_feasible(info, variant, rank)
+                            for c in self._hard_constraints
+                            if c is not self._moe_constraint
+                        )
+                    })
+                common = set.intersection(*feasible_sets) if feasible_sets else set()
+                if not common:
+                    for i in indices:
+                        mask[i] = False
         return mask
+
+    def enforce_moe_consistency(
+        self, graph: ComputationGraph, placement: torch.Tensor, ranks: torch.Tensor,
+        variant: str, candidate_ranks: Iterable[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project placed graph-discovered expert groups onto one common rank."""
+        if self._moe_constraint is None:
+            return placement, ranks
+        groups: Dict[str, List[int]] = {}
+        for i in range(graph.n_nodes):
+            info = self._node_info_from_graph(graph, i)
+            if placement[i] > 0.5 and info.semantic_role == "MoE_expert" and info.moe_group:
+                groups.setdefault(info.moe_group, []).append(i)
+        for indices in groups.values():
+            if len(indices) < 2:
+                continue
+            common = []
+            for rank in sorted({int(x) for x in candidate_ranks if int(x) > 0}):
+                if all(
+                    all(c.is_feasible(self._node_info_from_graph(graph, i), variant, rank)
+                        for c in self._hard_constraints if c is not self._moe_constraint)
+                    for i in indices
+                ):
+                    common.append(rank)
+            if not common:
+                for i in indices:
+                    placement[i] = 0.0
+                    ranks[i] = 0
+                continue
+            chosen = min(common, key=lambda rank: (sum(abs(int(ranks[i].item()) - rank) for i in indices), rank))
+            for i in indices:
+                ranks[i] = chosen
+        return placement, ranks
 
     def evaluate_soft(
         self,

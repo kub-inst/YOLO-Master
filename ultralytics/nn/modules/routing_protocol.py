@@ -86,6 +86,8 @@ def reset_routing_runtime_state(model: nn.Module | None = None, *, step: int | N
                 setattr(module, name, value.detach().new_zeros(()))
         if hasattr(module, "last_routing_snapshot"):
             module.last_routing_snapshot = {}
+        if hasattr(module, "last_routing_diagnostics"):
+            module.last_routing_diagnostics = {}
         if hasattr(module, "_last_routing_stats"):
             module._last_routing_stats = None
     return next_step
@@ -224,13 +226,81 @@ def iter_aux_records(
 def export_capabilities(module: nn.Module) -> dict[str, Any]:
     """Describe conservative export capabilities for a routed module."""
 
+    eager_sparse = bool(
+        getattr(module, "_routing_sparse_dispatch", False)
+        or getattr(module, "sparse_train", False)
+        or getattr(module, "use_sparse_inference", False)
+    )
     return {
         "routing_kind": getattr(module, "_routing_aux_kind", "unknown"),
+        "supported": True,
         "dynamic_routing": True,
-        "sparse_dispatch": bool(getattr(module, "sparse_train", False)),
+        "sparse_dispatch": eager_sparse,
+        "eager_sparse_dispatch": eager_sparse,
+        "onnx_sparse_dispatch": False,
+        "torchscript_trace_sparse_dispatch": False,
+        "exact_sparse_export": False,
         "export_safe_dense_fallback": True,
+        "sparse_export_limitation": (
+            "Data-dependent expert dispatch is supported only in eager execution; "
+            "ONNX and TorchScript tracing use the dense fallback."
+            if eager_sparse
+            else "This module uses dense routed execution in eager and exported graphs."
+        ),
         "aux_loss_training_only": True,
     }
+
+
+def graph_connected_finite_zero(*values: torch.Tensor) -> torch.Tensor:
+    """Return a finite scalar zero while preserving a safe autograd connection."""
+
+    tensors = [value for value in values if isinstance(value, torch.Tensor)]
+    if not tensors:
+        return torch.tensor(0.0)
+    source = next((value for value in tensors if value.requires_grad), tensors[0])
+    safe = torch.nan_to_num(source.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    return safe.sum() * 0.0
+
+
+def routing_finite_diagnostics(
+    *,
+    logits: torch.Tensor | None = None,
+    probabilities: torch.Tensor | None = None,
+    aux_loss: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Summarize the first non-finite routing boundary without retaining graphs."""
+
+    if torch.jit.is_tracing() or torch.onnx.is_in_onnx_export():
+        return {
+            "first_nonfinite_boundary": None,
+            "logits_finite": None,
+            "logits_nonfinite_count": None,
+            "probabilities_finite": None,
+            "probabilities_nonfinite_count": None,
+            "aux_loss_finite": None,
+            "aux_loss_nonfinite_count": None,
+            "all_finite": None,
+        }
+    values = (
+        ("router_logits", "logits", logits),
+        ("router_probabilities", "probabilities", probabilities),
+        ("aux_loss", "aux_loss", aux_loss),
+    )
+    diagnostics: dict[str, Any] = {"first_nonfinite_boundary": None}
+    for boundary, key, value in values:
+        if not isinstance(value, torch.Tensor):
+            diagnostics[f"{key}_finite"] = None
+            diagnostics[f"{key}_nonfinite_count"] = None
+            continue
+        detached = value.detach()
+        finite = torch.isfinite(detached)
+        all_finite = bool(finite.all().item())
+        diagnostics[f"{key}_finite"] = all_finite
+        diagnostics[f"{key}_nonfinite_count"] = int((~finite).sum().item())
+        if not all_finite and diagnostics["first_nonfinite_boundary"] is None:
+            diagnostics["first_nonfinite_boundary"] = boundary
+    diagnostics["all_finite"] = diagnostics["first_nonfinite_boundary"] is None
+    return diagnostics
 
 
 def routing_snapshot(module: nn.Module) -> dict[str, Any]:
@@ -324,9 +394,11 @@ __all__ = [
     "configure_mixture_temperature_schedule",
     "current_aux_step",
     "export_capabilities",
+    "graph_connected_finite_zero",
     "get_aux_record",
     "iter_aux_records",
     "publish_aux_loss",
     "reset_routing_runtime_state",
+    "routing_finite_diagnostics",
     "routing_snapshot",
 ]

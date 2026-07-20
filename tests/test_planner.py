@@ -278,6 +278,46 @@ class TestArchitectureFingerprint:
         # 2 conv + 2 linear = 4 total; text_fusion_proj and fusion_conv names give text
         assert fp.phi_text == pytest.approx(2 / 4, abs=1e-6)
 
+    def test_depth_uses_wrapped_sequential_graph(self):
+        model = nn.Module()
+        model.model = nn.Sequential(
+            nn.Conv2d(3, 8, 3),
+            nn.ReLU(),
+            nn.Conv2d(8, 16, 3),
+            nn.ReLU(),
+        )
+        fp = ArchitectureFingerprint.compute(model)
+        assert fp.phi_depth == pytest.approx(4 / 30, abs=1e-6)
+
+    def test_real_world_module_classes_are_text_fusion(self):
+        class WorldDetect(nn.Module):
+            def forward(self, x):
+                return x
+
+        class WorldModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Sequential(nn.Conv2d(3, 8, 1), nn.Linear(8, 8), nn.Identity())
+                self.world = WorldDetect()
+
+        model = WorldModel()
+        fp = ArchitectureFingerprint.compute(model)
+        assert fp.phi_text > 0.0
+        assert ArchitectureFingerprint._detect_architecture_family(model) == "yolo_world"
+
+    def test_paper_fingerprint_dimensions_are_present(self):
+        fp = ArchitectureFingerprint.compute(_make_yolo11s_like())
+        assert hasattr(fp, "phi_moe") and hasattr(fp, "phi_conv")
+        assert 0.0 <= fp.phi_moe <= 1.0
+        assert 0.0 <= fp.phi_conv <= 1.0
+
+    def test_known_world_family_uses_paper_profile(self):
+        model = _make_yolo_world_like()
+        fp = ArchitectureFingerprint.compute(model)
+        assert fp.phi_attn == pytest.approx(0.45)
+        assert fp.phi_text == pytest.approx(0.5)
+        ArchitectureFingerprint.invalidate_cache(model)
+
     def test_depthwise_conv(self):
         class _Model(nn.Module):
             def __init__(self):
@@ -438,6 +478,17 @@ class TestPEFTPlannerPlan:
         assert decision.status == "ACCEPT"
         assert decision.predicted_delta == pytest.approx(0.071, abs=0.01)
         assert "attn" not in (decision.target_modules_hint or [])
+
+    def test_budget_infeasible_refuses(self):
+        model = _make_yolo11s_like()
+        decision = PEFTPlanner().plan(model, LoRAConfig(peft_type="lora", r=8, adapter_budget=1))
+        assert decision.status == "REFUSE"
+        assert decision.safety_overrides["budget_infeasible"] is True
+
+    def test_paper_prediction_is_separate_from_extended_prediction(self):
+        planner = PEFTPlanner()
+        fp = ArchitectureFingerprint(phi_attn=0.45, phi_text=0.5, phi_dw=0.0)
+        assert planner.predict_paper(fp, "lora") == pytest.approx(0.06677, abs=1e-6)
 
     def test_yolo11s_dora_accept(self):
         """YOLO11s + DoRA r=16 → ACCEPT (Table 1: Δ=+0.0710)."""
@@ -637,6 +688,21 @@ class TestPEFTPlannerDetectTargets:
         assert any("text" in t for t in targets)
         assert any("fusion" in t or "text_proj" in t for t in targets)
 
+    def test_world_class_targets_are_not_lost_to_numeric_paths(self):
+        class ContrastiveHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = nn.Linear(8, 8)
+
+        class WorldDetect(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cv4 = nn.Sequential(ContrastiveHead())
+
+        model = nn.Sequential(nn.Conv2d(3, 8, 1), WorldDetect())
+        targets = PEFTPlanner().detect_targets(model, LoRAConfig(include_head=False))
+        assert "1.cv4.0.proj" in targets
+
     def test_config_filter_exclude_modules(self):
         model = _make_yolo11s_like()
         planner = PEFTPlanner()
@@ -811,6 +877,16 @@ class TestLOVOEngine:
         history = collector.to_history()
         assert len(history) == 10
         assert all(isinstance(h, tuple) and len(h) == 3 for h in history)
+        assert collector.to_ranks() == [8] * 10
+
+    def test_collector_preserves_rank(self, tmp_path):
+        collector = LOVODataCollector([
+            LOVODataPoint(ArchitectureFingerprint(0.0, 0.0, 0.0), "lora", 0.0710, rank=16)
+        ])
+        path = tmp_path / "ranked_lovo_data.json"
+        collector.save(path)
+        loaded = LOVODataCollector.load(path)
+        assert loaded.to_ranks() == [16]
 
     def test_collector_summary(self):
         collector = LOVODataCollector()
@@ -893,3 +969,37 @@ class TestLOVOEngine:
         validator = LOVOValidator()
         with pytest.raises(ValueError, match="at least 5"):
             validator.cross_validate([])
+
+    def test_variant_lovo_holds_out_entire_variant(self):
+        points = []
+        for model, attn in (("cnn", 0.0), ("yolo12", 0.45), ("rtdetr", 0.85)):
+            for variant, delta in (("lora", 0.06), ("dora", 0.05), ("loha", 0.04)):
+                points.append(
+                    LOVODataPoint(
+                        ArchitectureFingerprint(attn, 0.0, 0.0),
+                        variant,
+                        delta,
+                        model_name=model,
+                    )
+                )
+        result = LOVOValidator().cross_validate_variant(points)
+        assert result["held_out_variants"] == ["dora", "loha", "lora"]
+        for fold in result["folds"]:
+            assert fold["held_out"] not in fold["train_variants"]
+
+    def test_architecture_loao_holds_out_complete_model(self):
+        points = []
+        for model, attn in (("cnn", 0.0), ("yolo12", 0.45), ("rtdetr", 0.85)):
+            for variant, delta in (("lora", 0.06), ("dora", 0.05), ("loha", 0.04)):
+                points.append(
+                    LOVODataPoint(
+                        ArchitectureFingerprint(attn, 0.0, 0.0),
+                        variant,
+                        delta,
+                        model_name=model,
+                    )
+                )
+        result = LOVOValidator().cross_validate_architecture(points)
+        assert result["held_out_architectures"] == ["cnn", "rtdetr", "yolo12"]
+        for fold in result["folds"]:
+            assert fold["held_out"] not in fold["train_architectures"]
