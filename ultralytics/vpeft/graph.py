@@ -474,6 +474,22 @@ class ComputationGraphBuilder:
             or any(token in class_name.lower() for token in ("moe", "router", "expert", "molora"))
             for class_name in ancestor_names
         )
+        moe_group = ""
+        # A standalone MoE container may expose ``num_experts`` on the root
+        # module, while the expert leaves are named ``experts.<idx>`` and have
+        # no intermediate MoE ancestor.
+        if int(getattr(root, "num_experts", 0) or 0) > 0 and "experts." in name.lower():
+            moe_group = name.split(".experts.", 1)[0] if ".experts." in name else "experts"
+        for depth, ancestor in enumerate(ancestors):
+            if int(getattr(ancestor, "num_experts", 0) or 0) <= 0:
+                continue
+            prefix = ".".join(name.split(".")[: depth + 1])
+            relative = name[len(prefix):].lstrip(".").lower()
+            if relative.startswith("experts.") or ".experts." in relative or "expert" in relative:
+                moe_group = prefix
+                break
+        if moe_group:
+            text_fusion = False
         return {
             "ancestor_classes": ancestor_names,
             "head_family": next((name for name in reversed(ancestor_names) if name in head_classes), None),
@@ -483,6 +499,7 @@ class ComputationGraphBuilder:
             "shared_backbone": not in_head,
             "dynamic_routing": dynamic_routing,
             "merge_semantics": "dynamic_router" if dynamic_routing else "exact",
+            "moe_group": moe_group,
         }
 
     @staticmethod

@@ -71,7 +71,7 @@ class MoTBlock(nn.Module):
         super().__init__()
         if not 1 <= top_k <= self.NUM_EXPERTS:
             raise ValueError(f"top_k must be in [1, {self.NUM_EXPERTS}], got {top_k}")
-        self.top_k = top_k
+        self._top_k = int(top_k)
         self.balance_loss_coeff = balance_loss_coeff
         self.sparse_train = sparse_train
         self.scene_consistency_coeff = max(float(scene_consistency_coeff), 0.0)
@@ -127,7 +127,19 @@ class MoTBlock(nn.Module):
         """Number of Transformer expert branches."""
         return self.NUM_EXPERTS
 
-    # top_k is already stored as self.top_k (instance attribute).
+    @property
+    def top_k(self) -> int:
+        """Number of Transformer experts active per forward."""
+        return self._top_k
+
+    @top_k.setter
+    def top_k(self, value: int) -> None:
+        value = int(value)
+        if not 1 <= value <= self.NUM_EXPERTS:
+            raise ValueError(f"top_k must be in [1, {self.NUM_EXPERTS}], got {value}")
+        self._top_k = value
+        if hasattr(self, "router"):
+            self.router.top_k = value
 
     @property
     def aux_loss(self) -> torch.Tensor:
