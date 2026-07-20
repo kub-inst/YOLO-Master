@@ -2192,9 +2192,9 @@ class PEFTPlanner:
 
         # If a safety guardrail already triggered a variant change.
         if recommended_variant is not None:
-            new_delta = variant_scores.get(
-                recommended_variant, self.predict(fingerprint, recommended_variant, rank)
-            )
+            new_delta = variant_scores.get(recommended_variant)
+            if new_delta is None:
+                new_delta = self.predict(fingerprint, recommended_variant, rank)
             decision = PlacementDecision(
                 status="ADAPT",
                 recommended_variant=recommended_variant,

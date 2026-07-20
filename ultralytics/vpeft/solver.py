@@ -205,8 +205,16 @@ class AlternatingOptimizationSolver(ConstraintSolver):
         budget: int,
         utilities: torch.Tensor,
         hard_mask: torch.Tensor,
+        constraints: ConstraintRegistry,
+        lambda_dual: Dict[str, float],
     ) -> torch.Tensor:
-        """Greedy placement by utility density under fixed ranks."""
+        """Greedy placement by Lagrangian utility density under fixed ranks.
+
+        AO historically updated dual multipliers but never used them while
+        selecting modules.  Soft constraint penalties now reduce each
+        candidate's density, so dual ascent changes subsequent placements.
+        The hard budget remains enforced by the knapsack projection below.
+        """
         n = graph.n_nodes
         scores = torch.full((n,), float("-inf"))
         for i in range(n):
@@ -216,13 +224,23 @@ class AlternatingOptimizationSolver(ConstraintSolver):
             if cost <= 0:
                 continue
             util = utilities[i].item() * _utility_per_rank(r[i].item(), self.rank_max)
-            scores[i] = util / cost
+            node_info = constraints._node_info_from_graph(graph, i)
+            dual_penalty = sum(
+                float(lambda_dual.get(name, 0.0)) * value
+                for name, value in constraints.compute_penalty_breakdown(
+                    node_info, xi[i], int(r[i].item())
+                ).items()
+            )
+            scores[i] = (util - dual_penalty) / cost
 
         sorted_idx = torch.argsort(scores, descending=True)
         pi_new = torch.zeros(n)
         used = 0
         for idx in sorted_idx:
-            if scores[idx] == float("-inf"):
+            # A negative Lagrangian density means the soft penalty outweighs
+            # the expected utility; selecting it would reduce the objective
+            # even when budget remains available.
+            if not torch.isfinite(scores[idx]) or scores[idx] <= 0:
                 break
             cost = graph.estimate_params(idx.item(), r[idx].item(), xi[idx])
             if used + cost <= budget:
@@ -310,7 +328,9 @@ class AlternatingOptimizationSolver(ConstraintSolver):
             xi_prev = list(xi)
 
             # Step 1: fix (r, ξ) → optimise π
-            pi = self._optimize_pi(graph, r, xi, budget, utilities, hard_mask)
+            pi = self._optimize_pi(
+                graph, r, xi, budget, utilities, hard_mask, constraints, lambda_dual
+            )
 
             # Step 2: fix (π, ξ) → optimise r
             r = self._rank_allocator.allocate(graph, pi, budget, variant, constraints=constraints)
@@ -336,6 +356,7 @@ class AlternatingOptimizationSolver(ConstraintSolver):
 
         # --- post-processing -----------------------------------------------
         pi, r = _project_discrete_solution(graph, pi, r, variant, constraints, self.rank_set)
+        pi, r = constraints.enforce_moe_consistency(graph, pi, r, variant, self.rank_set)
         budget_used = int(constraints.get_budget_usage(graph, pi, r, variant))
         budget_remaining = max(0, budget - budget_used)
         target_modules = [
@@ -614,6 +635,9 @@ class DifferentiableOptimizationSolver(ConstraintSolver):
         pi_discrete, r_discrete = _project_discrete_solution(
             graph, pi_discrete, r_discrete, variant_global, constraints, self.rank_set
         )
+        pi_discrete, r_discrete = constraints.enforce_moe_consistency(
+            graph, pi_discrete, r_discrete, variant_global, self.rank_set
+        )
 
         # Post-process: ensure budget is respected by dropping lowest-utility placed modules
         used = int(constraints.get_budget_usage(graph, pi_discrete, r_discrete, variant_global))
@@ -758,6 +782,7 @@ class MIPRelaxationSolver(ConstraintSolver):
         )
         r = allocator.allocate(graph, pi, budget, variant, constraints=constraints)
         pi, r = _project_discrete_solution(graph, pi, r, variant, constraints, self.rank_set)
+        pi, r = constraints.enforce_moe_consistency(graph, pi, r, variant, self.rank_set)
 
         budget_used = int(constraints.get_budget_usage(graph, pi, r, variant))
         budget_remaining = max(0, budget - budget_used)
@@ -877,6 +902,9 @@ class MIPRelaxationSolver(ConstraintSolver):
                         break
         pi_vals, ranks = _project_discrete_solution(
             graph, pi_vals, ranks, variant, constraints, self.rank_set
+        )
+        pi_vals, ranks = constraints.enforce_moe_consistency(
+            graph, pi_vals, ranks, variant, self.rank_set
         )
 
         budget_used = int(constraints.get_budget_usage(graph, pi_vals, ranks, variant))
