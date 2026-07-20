@@ -164,6 +164,7 @@ def _record_moe_snapshot(
     topk_weights: Optional[torch.Tensor] = None,
     router_probs: Optional[torch.Tensor] = None,
     aux_loss: Optional[torch.Tensor] = None,
+    finite_diagnostics: Optional[dict] = None,
 ) -> None:
     """Store a compact, detached routing snapshot for later diagnostics.
 
@@ -205,6 +206,8 @@ def _record_moe_snapshot(
         "mean_router_probs": mean_probs,
         "aux_loss": aux_loss.detach().float() if isinstance(aux_loss, torch.Tensor) else float(aux_loss or 0.0),
     }
+    if finite_diagnostics is not None:
+        snapshot["finite_diagnostics"] = dict(finite_diagnostics)
 
     if isinstance(topk_weights, torch.Tensor):
         weights = _flatten_moe_topk(topk_weights.detach().float())

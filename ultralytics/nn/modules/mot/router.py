@@ -11,6 +11,8 @@ import torch.nn.functional as F
 
 from ultralytics.nn.modules._numeric import stable_normalize
 from ultralytics.nn.modules.moe import loss as _moe_loss
+from ultralytics.nn.modules.routing_protocol import graph_connected_finite_zero
+from ultralytics.nn.modules.routing_protocol import routing_finite_diagnostics
 from ultralytics.nn.modules.utils import get_safe_groups as _safe_groups
 from ultralytics.nn.modules.mot._constants import (
     DEFAULT_MIN_TEMPERATURE,
@@ -283,10 +285,13 @@ def _mot_router_aux_loss(
     z_coeff: float,
     *,
     reduce_ddp: bool = False,
-) -> torch.Tensor:
+    return_diagnostics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict]:
     """GShard balance + router z-loss for MoT (matches MoE/MoLoRA formulation)."""
     if balance_coeff <= 0 and z_coeff <= 0:
-        return weights.new_zeros(())
+        total = weights.new_zeros(())
+        diagnostics = routing_finite_diagnostics(logits=logits, probabilities=weights, aux_loss=total)
+        return (total, diagnostics) if return_diagnostics else total
 
     probs = weights
     if probs.dim() == 4:
@@ -302,10 +307,11 @@ def _mot_router_aux_loss(
         total = total + balance_coeff * balance
     if z_coeff > 0:
         total = total + z_coeff * z_loss
+    diagnostics = routing_finite_diagnostics(logits=logits, probabilities=weights, aux_loss=total)
     # Guard against non-finite aux_loss propagating to total loss
     if not torch.isfinite(total):
-        return weights.new_zeros(())
-    return total
+        total = graph_connected_finite_zero(weights, logits, total)
+    return (total, diagnostics) if return_diagnostics else total
 
 
 def anneal_mot_temperature(

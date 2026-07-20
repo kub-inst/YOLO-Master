@@ -33,6 +33,13 @@ from .routers import (
 from ultralytics.nn.modules.block import ABlock, A2C2f, C3k
 from .loss import MoELoss, gshard_balance_loss, weighted_gshard_balance_loss, differentiable_balance_loss, all_reduce_mean, should_reduce_ddp
 from .scheduler import MoEDynamicScheduler, MoEDynamicSchedulerConfig
+from ultralytics.nn.modules.routing_protocol import (
+    export_capabilities as _export_routing_capabilities,
+    graph_connected_finite_zero,
+    publish_aux_loss,
+    routing_finite_diagnostics,
+    routing_snapshot as _routing_snapshot,
+)
 
 # Re-export all helpers (backward compatibility for external imports)
 from ._helpers import (
@@ -162,6 +169,7 @@ class UltraOptimizedMoE(nn.Module):
         self.last_balance_loss = 0.0
         self.last_z_loss = 0.0
         self.last_routing_snapshot = {}
+        self.last_routing_diagnostics = {}
         # self.aux_loss is now managed via MOE_LOSS_REGISTRY property
 
     def _init_weights(self):
@@ -457,6 +465,7 @@ class ES_MOE(nn.Module):
         self.register_buffer("load_balancing_loss", torch.tensor(0.0), persistent=False)
         self.register_buffer("expert_usage_counts", torch.zeros(num_experts), persistent=False)
         self.last_routing_snapshot = {}
+        self.last_routing_diagnostics = {}
         # Expose balance_loss_coeff for GiniBalanceScheduler / apply_balance_loss_coeff
         self.balance_loss_coeff = 1.0
 
@@ -487,7 +496,11 @@ class ES_MOE(nn.Module):
     def forward(self, x):
         self._ensure_compat_attrs(x.device)
         # Get routing weights
-        routing_weights = self.routing(x)
+        try:
+            routing_weights = self.routing(x)
+        except Exception:
+            self.last_routing_diagnostics = dict(getattr(self.routing, "last_routing_diagnostics", {}))
+            raise
 
         # Compute load-balancing loss
         load_balance_loss = self._compute_load_balancing_loss(routing_weights)
@@ -499,6 +512,7 @@ class ES_MOE(nn.Module):
                 expert_usage=routing_weights.mean(dim=(0, 2, 3)),
                 router_probs=routing_weights,
                 aux_loss=load_balance_loss,
+                finite_diagnostics=self.last_routing_diagnostics,
             )
 
         # Dense forward only during training (gradients to all experts) or when
@@ -533,6 +547,26 @@ class ES_MOE(nn.Module):
     def aux_loss(self):
         """Retrieve the auxiliary loss from the registry."""
         return _get_moe_aux_loss(self)
+
+    def publish_aux_loss(self, *, step: int, training: bool) -> torch.Tensor:
+        return publish_aux_loss(self, self.aux_loss, step=step, kind="moe", training=training)
+
+    def routing_snapshot(self) -> dict:
+        return _routing_snapshot(self)
+
+    def export_capabilities(self) -> dict:
+        capabilities = _export_routing_capabilities(self)
+        eager_sparse = bool(self.use_sparse_inference and self.top_k < self.num_experts)
+        capabilities.update(
+            routing_kind="moe",
+            sparse_dispatch=eager_sparse,
+            eager_sparse_dispatch=eager_sparse,
+            sparse_export_limitation=(
+                "ES_MOE eager inference supports sample-level Top-K dispatch; ONNX and TorchScript tracing execute "
+                "all experts through the dense fallback."
+            ),
+        )
+        return capabilities
 
     def get_gflops(self, input_shape: Tuple[int, int, int, int]) -> Dict[str, float]:
         """Estimate GFLOPs for a single forward pass.
@@ -624,10 +658,23 @@ class ES_MOE(nn.Module):
         # global balance target (matches MoELoss; no-op on single GPU).
         load_balance_loss = gshard_balance_loss(expert_usage, self.num_experts, reduce_ddp=should_reduce_ddp(self))
 
+        router_diagnostics = getattr(self.routing, "last_routing_diagnostics", {})
+        downstream = routing_finite_diagnostics(probabilities=routing_weights, aux_loss=load_balance_loss)
+        self.last_routing_diagnostics = dict(router_diagnostics)
+        for key, value in downstream.items():
+            if key == "first_nonfinite_boundary":
+                if self.last_routing_diagnostics.get(key) is None:
+                    self.last_routing_diagnostics[key] = value
+            elif value is not None:
+                self.last_routing_diagnostics[key] = value
+        self.last_routing_diagnostics["all_finite"] = (
+            self.last_routing_diagnostics.get("first_nonfinite_boundary") is None
+        )
+
         # Guard against NaN loss (graph-safe: keep grad_fn instead of new leaf)
         exporting = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
         if not exporting and not torch.isfinite(load_balance_loss).all():
-            load_balance_loss = torch.nan_to_num(load_balance_loss, nan=0.0, posinf=0.0, neginf=0.0)
+            load_balance_loss = graph_connected_finite_zero(routing_weights, load_balance_loss)
 
         if not exporting:
             self.load_balancing_loss.copy_(load_balance_loss.detach())

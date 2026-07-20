@@ -10,6 +10,7 @@ from urllib.request import Request, urlopen
 from typing import Tuple, Optional, Dict
 from .utils import FlopsUtils, get_safe_groups
 from ultralytics.nn.modules._numeric import stable_normalize
+from ultralytics.nn.modules.routing_protocol import routing_finite_diagnostics
 from ultralytics.utils.errors import MoERouterError, ShapeMismatchError
 
 
@@ -477,6 +478,8 @@ class DynamicRoutingLayer(nn.Module):
             _validate_router_input(x, self.in_channels, "DynamicRoutingLayer")
         pooled = self.global_pool(x)
         routing_logits = self.routing_network(pooled)  # [B, num_experts, 1, 1]
+        if not exporting:
+            self.last_routing_diagnostics = routing_finite_diagnostics(logits=routing_logits)
         if not exporting and not torch.isfinite(routing_logits).all():
             raise MoERouterError("DynamicRoutingLayer internal output contains NaN/Inf values")
 
@@ -500,6 +503,11 @@ class DynamicRoutingLayer(nn.Module):
                 routing_weights = self._soft_top_k(routing_logits)
             else:
                 routing_weights = self._hard_top_k(routing_logits)
+
+        if not exporting:
+            self.last_routing_diagnostics = routing_finite_diagnostics(
+                logits=routing_logits, probabilities=routing_weights
+            )
 
         return routing_weights.repeat(1, 1, x.size(2), x.size(3))
 
