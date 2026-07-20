@@ -582,6 +582,14 @@ def refresh_fingerprints(results: list[dict[str, Any]]) -> None:
     gc.collect()
 
 
+def normalize_legacy_protocol_metadata(results: list[dict[str, Any]]) -> None:
+    """Normalize records created before explicit AMP/protocol fields existed."""
+    for record in results:
+        if "amp" not in record:
+            # The original main matrix used the trainer default (AMP enabled).
+            record["amp"] = True if record.get("batch") == 8 else None
+
+
 def main() -> int:
     args = parse_args()
     if args.device != "mps" or not torch.backends.mps.is_available():
@@ -597,6 +605,7 @@ def main() -> int:
             for record in load_results(result_file):
                 indexed[record["experiment_id"]] = record
         results = list(indexed.values())
+    normalize_legacy_protocol_metadata(results)
     if not args.fit_only:
         models = parse_models(args.models or list(DEFAULT_MODELS))
         matrix = build_matrix(models, args)
