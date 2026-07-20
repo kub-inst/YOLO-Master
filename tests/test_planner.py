@@ -811,6 +811,16 @@ class TestLOVOEngine:
         history = collector.to_history()
         assert len(history) == 10
         assert all(isinstance(h, tuple) and len(h) == 3 for h in history)
+        assert collector.to_ranks() == [8] * 10
+
+    def test_collector_preserves_rank(self, tmp_path):
+        collector = LOVODataCollector([
+            LOVODataPoint(ArchitectureFingerprint(0.0, 0.0, 0.0), "lora", 0.0710, rank=16)
+        ])
+        path = tmp_path / "ranked_lovo_data.json"
+        collector.save(path)
+        loaded = LOVODataCollector.load(path)
+        assert loaded.to_ranks() == [16]
 
     def test_collector_summary(self):
         collector = LOVODataCollector()

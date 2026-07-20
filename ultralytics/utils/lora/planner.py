@@ -643,6 +643,8 @@ class LOVODataPoint:
         model_name: Optional model name for metadata.
         dataset: Optional dataset name.
         epochs: Training epochs.
+        rank: Effective adapter rank used by the training run. Rankless
+            variants use 1 so the regression's log-rank feature stays neutral.
         timestamp: ISO-8601 timestamp.
         notes: Free-form notes.
     """
@@ -653,6 +655,7 @@ class LOVODataPoint:
     model_name: str = ""
     dataset: str = ""
     epochs: int = 0
+    rank: int = 8
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     notes: str = ""
 
@@ -679,6 +682,7 @@ class LOVODataPoint:
             "model_name": self.model_name,
             "dataset": self.dataset,
             "epochs": self.epochs,
+            "rank": self.rank,
             "timestamp": self.timestamp,
             "notes": self.notes,
         }
@@ -705,6 +709,7 @@ class LOVODataPoint:
             model_name=data.get("model_name", ""),
             dataset=data.get("dataset", ""),
             epochs=data.get("epochs", 0),
+            rank=max(int(data.get("rank", 8) or 8), 1),
             timestamp=data.get("timestamp", ""),
             notes=data.get("notes", ""),
         )
@@ -747,6 +752,10 @@ class LOVODataCollector:
     def to_history(self) -> List[Tuple[ArchitectureFingerprint, str, float]]:
         """Convert to the ``history`` format used by :meth:`PEFTPlanner.fit`."""
         return [p.to_tuple() for p in self.data_points]
+
+    def to_ranks(self) -> List[int]:
+        """Return ranks aligned with :meth:`to_history` for rank-aware fitting."""
+        return [max(int(p.rank), 1) for p in self.data_points]
 
     def save(self, path: Union[str, Path]) -> None:
         """Serialize to JSON.
@@ -904,6 +913,7 @@ class LOVOValidator:
                 round(p.fingerprint.phi_residual, 6),
                 round(p.fingerprint.phi_norm, 6),
                 p.variant.lower(),
+                max(int(p.rank), 1),
                 round(p.delta_mAP, 6),
             )
             if key not in seen:
@@ -919,11 +929,11 @@ class LOVOValidator:
         for left_out in unique_points:
             train_data = [p for p in unique_points if p is not left_out]
             train_history = [p.to_tuple() for p in train_data]
+            train_ranks = [max(int(p.rank), 1) for p in train_data]
 
             planner = PEFTPlanner()
-            planner.fit(train_history)
-            # Use default rank=8 for LOVO prediction (rank is not part of LOVO data)
-            predicted = planner.predict(left_out.fingerprint, left_out.variant, 8)
+            planner.fit(train_history, ranks=train_ranks)
+            predicted = planner.predict(left_out.fingerprint, left_out.variant, max(int(left_out.rank), 1))
             predictions.append((left_out.delta_mAP, predicted, left_out.variant))
 
         # Compute metrics
@@ -954,7 +964,7 @@ class LOVOValidator:
         # Final fit on all unique points
         full_planner = PEFTPlanner()
         full_history = [p.to_tuple() for p in unique_points]
-        full_planner.fit(full_history)
+        full_planner.fit(full_history, ranks=[max(int(p.rank), 1) for p in unique_points])
 
         return LOVOValidationResult(
             lovo_predictions=predictions,
@@ -1172,7 +1182,7 @@ class PEFTPlanner:
             return
         if self._history and not self._needs_refit:
             return  # Already fitted and no new data since last fit
-        self.fit(self.lovo_collector.to_history())
+        self.fit(self.lovo_collector.to_history(), ranks=self.lovo_collector.to_ranks())
         self._needs_refit = False
         if self.lovo_validator is not None:
             try:
@@ -1227,6 +1237,7 @@ class PEFTPlanner:
             model_name=model_name,
             dataset=dataset,
             epochs=epochs,
+            rank=max(int(rank), 1),
             notes=notes or f"rank={rank}",
         ))
         self._needs_refit = True
