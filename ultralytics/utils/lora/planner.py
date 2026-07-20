@@ -1156,6 +1156,14 @@ class PEFTPlanner:
         self._fit_n_samples = 0
         self._fit_effective_rank = 0
         self._fit_n_features = len(self.DEFAULT_COEFFS)
+        self._fit_regularization = 0.0
+        self._fit_condition_number = 0.0
+        self._fit_noise_variance = 0.0
+        self._fit_effective_dof = 0.0
+        self._fit_feature_mean = None
+        self._fit_feature_scale = None
+        self._fit_posterior_covariance = None
+        self._fit_ranks: List[int] = []
         self._needs_refit = False  # Flag: re-fit on next plan() after new data
 
     def _maybe_fit_from_lovo(self) -> None:
@@ -1240,10 +1248,9 @@ class PEFTPlanner:
     ) -> None:
         """Fit regression coefficients from calibration history.
 
-        Solves the least-squares problem for Eq. 1 using ridge regression
-        (L2 regularisation) to handle rank-deficient design matrices gracefully.
-        Falls back to default coefficients if the system is under-determined
-        or singular.
+        Solves a prior-centered Bayesian ridge problem for Eq. 1. Non-intercept
+        features are standardized, zero-variance columns stay at their default
+        coefficients, and generalized cross-validation selects the regularizer.
 
         The regression model uses 12 features:
             [1, phi_attn, phi_text, phi_dw, xi,
@@ -1255,10 +1262,10 @@ class PEFTPlanner:
         A quadratic allows the regression to model this sharp transition without
         requiring hard guardrails for the regression path.
 
-        Ridge regression (L2 penalty λ=0.01) addresses the rank-deficiency
-        problem (12 features, ~10-12 samples, matrix rank 6/12).  The small
-        λ stabilises the solution without significantly biasing identifiable
-        coefficients.
+        The prior mean is :attr:`DEFAULT_COEFFS`, so an under-determined fit
+        updates only directions supported by calibration evidence instead of
+        shrinking unsupported coefficients to zero. The fitted posterior
+        covariance is retained for analytic prediction uncertainty.
 
         When ``ranks`` is not provided (backward-compatible path), log(r)
         defaults to log(8) ≈ 3.0, which is a neutral mid-range value.
@@ -1268,12 +1275,19 @@ class PEFTPlanner:
             ranks: Optional list of LoRA ranks corresponding to each history
                 entry. If None, a default rank of 8 is assumed for all entries.
         """
-        import math
-
-        self._history = history
+        self._history = list(history)
         self._fit_n_samples = len(history)
         self._fit_effective_rank = 0
+        self._fit_regularization = 0.0
+        self._fit_condition_number = 0.0
+        self._fit_noise_variance = 0.0
+        self._fit_effective_dof = 0.0
+        self._fit_feature_mean = None
+        self._fit_feature_scale = None
+        self._fit_posterior_covariance = None
+        self._fit_ranks = [max(int(ranks[i]), 1) if ranks is not None and i < len(ranks) else 8 for i in range(len(history))]
         if len(history) < 5:
+            self._coeffs = list(self.DEFAULT_COEFFS)
             LOGGER.warning(
                 "[Planner] Insufficient calibration data (%d samples). "
                 "Using default coefficients.",
@@ -1292,74 +1306,117 @@ class PEFTPlanner:
         X = []
         y = []
         for i, (fingerprint, variant, delta_map) in enumerate(history):
-            profile = PEFTVariantProfile.from_variant(variant)
-            xi = profile.xi
-            # Determine rank for this data point
-            if ranks is not None and i < len(ranks):
-                r = max(ranks[i], 1)
-            else:
-                r = 8  # default rank assumption
-            log_r = math.log2(r)
-            phi_attn_sq = fingerprint.phi_attn ** 2
-
-            X.append(
-                [
-                    1.0,
-                    fingerprint.phi_attn,
-                    fingerprint.phi_text,
-                    fingerprint.phi_dw,
-                    xi,
-                    fingerprint.phi_depth,
-                    fingerprint.phi_width,
-                    fingerprint.phi_head,
-                    fingerprint.phi_residual,
-                    fingerprint.phi_norm,
-                    log_r,
-                    phi_attn_sq,
-                ]
-            )
+            X.append(self._feature_vector(fingerprint, variant, self._fit_ranks[i]))
             y.append(delta_map)
 
         X_arr = np.array(X, dtype=np.float64)
         y_arr = np.array(y, dtype=np.float64)
 
-        # Ridge regression: (X^T X + λI)⁻¹ X^T y
-        # λ=1e-6 provides minimal regularisation that resolves the singularity
-        # without significantly biasing identifiable coefficients.
-        # The previous λ=0.01 was too aggressive — it shrunk the xi coefficient
-        # (which ranges from -0.02 to 0.0152) by 87%, breaking prediction accuracy.
-        # λ=1e-6 is sufficient because the singularity comes from zero-variance
-        # columns (extended dims are all-zero when test data only has 5-dim
-        # fingerprints), not from multicollinearity among identifiable features.
         n_features = X_arr.shape[1]
-        ridge_lambda = 1e-6
-        XtX = X_arr.T @ X_arr
-        XtX_reg = XtX + ridge_lambda * np.eye(n_features)
-        Xty = X_arr.T @ y_arr
-        try:
-            beta = np.linalg.solve(XtX_reg, Xty)
-        except np.linalg.LinAlgError:
-            # Fallback to lstsq if ridge matrix is still singular
-            beta, residuals, rank, s = np.linalg.lstsq(X_arr, y_arr, rcond=None)
+        feature_mean = X_arr[:, 1:].mean(axis=0)
+        raw_scale = X_arr[:, 1:].std(axis=0)
+        feature_scale = np.where(raw_scale > 1e-10, raw_scale, 1.0)
+        Z = np.ones_like(X_arr)
+        Z[:, 1:] = (X_arr[:, 1:] - feature_mean) / feature_scale
+
+        prior_beta = np.asarray(self.DEFAULT_COEFFS, dtype=np.float64)
+        if prior_beta.size < n_features:
+            prior_beta = np.pad(prior_beta, (0, n_features - prior_beta.size))
+        prior_beta = prior_beta[:n_features]
+        prior_theta = prior_beta.copy()
+        prior_theta[0] = prior_beta[0] + feature_mean @ prior_beta[1:]
+        prior_theta[1:] = prior_beta[1:] * feature_scale
+        centered_target = y_arr - Z @ prior_theta
+
+        active_columns = np.concatenate((np.array([True]), raw_scale > 1e-10))
+        active_design = Z[:, active_columns]
+        mat_rank = np.linalg.matrix_rank(active_design)
+        singular_values = np.linalg.svd(active_design, compute_uv=False)
+        if singular_values.size and singular_values[-1] > np.finfo(np.float64).eps:
+            condition_number = float(singular_values[0] / singular_values[-1])
+        else:
+            condition_number = 1e12
+        condition_number = min(condition_number, 1e12)
+
+        penalty = np.ones(n_features, dtype=np.float64)
+        penalty[0] = 1e-6
+        penalty_matrix = np.diag(penalty)
+        XtX = Z.T @ Z
+        spectral_scale = max(float(np.trace(XtX) / max(int(mat_rank), 1)), 1.0)
+        rank_deficit = max(n_features - int(mat_rank), 0) / max(n_features, 1)
+        candidates = spectral_scale * np.logspace(-6, 2, 25)
+        candidates = np.unique(np.concatenate((candidates, [spectral_scale * max(rank_deficit, 1e-6) * 1e-3])))
+
+        best = None
+        for candidate in candidates:
+            precision = XtX + float(candidate) * penalty_matrix
+            try:
+                precision_inv = np.linalg.inv(precision)
+            except np.linalg.LinAlgError:
+                precision_inv = np.linalg.pinv(precision)
+            delta = precision_inv @ (Z.T @ centered_target)
+            residual = centered_target - Z @ delta
+            effective_dof = float(np.trace(Z @ precision_inv @ Z.T))
+            denominator = max(len(history) - effective_dof, 1e-6)
+            gcv = float(len(history) * (residual @ residual) / (denominator * denominator))
+            if best is None or gcv < best[0]:
+                best = (gcv, float(candidate), precision_inv, delta, effective_dof)
+
+        _, ridge_lambda, precision_inv, delta, effective_dof = best
+        theta = prior_theta + delta
+        beta = theta.copy()
+        beta[1:] = theta[1:] / feature_scale
+        beta[0] = theta[0] - feature_mean @ beta[1:]
+        fitted = X_arr @ beta
+        residual = y_arr - fitted
+        residual_dof = max(len(history) - effective_dof, 1.0)
+        variance_floor = max(float(np.var(y_arr)) * 1e-4, 1e-10)
+        noise_variance = max(float(residual @ residual) / residual_dof, variance_floor)
 
         self._coeffs = beta.tolist()
-
-        # Pad coefficients list if old 11-dim data was loaded
-        if len(self._coeffs) < 12:
-            self._coeffs = list(self._coeffs) + [0.0] * (12 - len(self._coeffs))
-
-        # Compute matrix rank for diagnostic logging
-        mat_rank = np.linalg.matrix_rank(X_arr)
         self._fit_effective_rank = int(mat_rank)
         self._fit_n_features = int(n_features)
+        self._fit_regularization = float(ridge_lambda)
+        self._fit_condition_number = condition_number
+        self._fit_noise_variance = noise_variance
+        self._fit_effective_dof = effective_dof
+        self._fit_feature_mean = feature_mean
+        self._fit_feature_scale = feature_scale
+        self._fit_posterior_covariance = noise_variance * precision_inv
         LOGGER.info(
-            "[Planner] Fitted regression coefficients (12-dim, ridge λ=%.3f): %s",
+            "[Planner] Fitted prior-centered Bayesian ridge coefficients (12-dim, λ=%.6g): %s",
             ridge_lambda, self._coeffs,
         )
         LOGGER.info(
-            "[Planner] Fit matrix rank: %d / %d (features), %d samples.",
-            mat_rank, n_features, len(history),
+            "[Planner] Fit rank=%d/%d, effective_dof=%.2f, condition=%.3g, samples=%d.",
+            mat_rank, n_features, effective_dof, condition_number, len(history),
         )
+
+    @staticmethod
+    def _feature_vector(
+        fingerprint: ArchitectureFingerprint,
+        variant: str,
+        rank: int,
+    ) -> List[float]:
+        """Build the canonical 12-dimensional Planner regression vector."""
+
+        import math
+
+        xi = PEFTVariantProfile.from_variant(variant).xi
+        return [
+            1.0,
+            fingerprint.phi_attn,
+            fingerprint.phi_text,
+            fingerprint.phi_dw,
+            xi,
+            fingerprint.phi_depth,
+            fingerprint.phi_width,
+            fingerprint.phi_head,
+            fingerprint.phi_residual,
+            fingerprint.phi_norm,
+            math.log2(max(rank, 1)),
+            fingerprint.phi_attn**2,
+        ]
 
     def predict(
         self,
@@ -1387,35 +1444,15 @@ class PEFTPlanner:
         Returns:
             float: Predicted ΔmAP.
         """
-        import math
-
-        profile = PEFTVariantProfile.from_variant(variant)
-        xi = profile.xi
         coeffs = self._coeffs
-        log_r = math.log2(max(rank, 1))
-        phi_attn_sq = fingerprint.phi_attn ** 2
 
         # Graceful fallback: if coefficients are still <12-dim (old data),
         # pad with zeros for the new features.
         if len(coeffs) < 12:
             coeffs = list(coeffs) + [0.0] * (12 - len(coeffs))
 
-        b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11 = coeffs
-        delta = (
-            b0
-            + b1 * fingerprint.phi_attn
-            + b2 * fingerprint.phi_text
-            + b3 * fingerprint.phi_dw
-            + b4 * xi
-            + b5 * fingerprint.phi_depth
-            + b6 * fingerprint.phi_width
-            + b7 * fingerprint.phi_head
-            + b8 * fingerprint.phi_residual
-            + b9 * fingerprint.phi_norm
-            + b10 * log_r
-            + b11 * phi_attn_sq
-        )
-        return float(delta)
+        features = self._feature_vector(fingerprint, variant, rank)
+        return float(sum(coefficient * feature for coefficient, feature in zip(coeffs, features)))
 
     def predict_with_uncertainty(
         self,
@@ -1423,11 +1460,12 @@ class PEFTPlanner:
         variant: str,
         rank: int = 8,
     ) -> Tuple[float, float]:
-        """Predict ΔmAP with bootstrap uncertainty estimate.
+        """Predict ΔmAP with posterior or bootstrap uncertainty.
 
-        Uses the stored calibration history to compute a bootstrap confidence
-        interval.  When no history is available, returns a heuristic uncertainty
-        based on the fingerprint's distance from the calibration centroid.
+        A fitted Bayesian ridge model uses analytic posterior predictive
+        variance. Bootstrap remains as a compatibility fallback for older
+        planner state without posterior diagnostics. When no history exists,
+        a conservative fingerprint-distance heuristic is used.
 
         Args:
             fingerprint: The architecture fingerprint.
@@ -1449,6 +1487,18 @@ class PEFTPlanner:
             import numpy as np
         except ImportError:
             return point_pred, 0.02
+
+        if (
+            self._fit_posterior_covariance is not None
+            and self._fit_feature_mean is not None
+            and self._fit_feature_scale is not None
+        ):
+            features = np.asarray(self._feature_vector(fingerprint, variant, rank), dtype=np.float64)
+            standardized = np.ones_like(features)
+            standardized[1:] = (features[1:] - self._fit_feature_mean) / self._fit_feature_scale
+            parameter_variance = float(standardized @ self._fit_posterior_covariance @ standardized)
+            predictive_variance = max(self._fit_noise_variance + parameter_variance, 0.0)
+            return point_pred, float(np.sqrt(predictive_variance))
 
         # Bootstrap: resample history with replacement, refit, predict.
         n_boot = min(50, len(self._history))
@@ -1474,7 +1524,15 @@ class PEFTPlanner:
             "calibration_n_samples": n_samples,
             "calibration_effective_rank": self._fit_effective_rank if fitted else 0,
             "calibration_n_features": self._fit_n_features,
-            "low_confidence": bool(fitted and n_samples < 30),
+            "calibration_regularization": self._fit_regularization if fitted else 0.0,
+            "calibration_condition_number": self._fit_condition_number if fitted else 0.0,
+            "calibration_noise_variance": self._fit_noise_variance if fitted else 0.0,
+            "calibration_effective_dof": self._fit_effective_dof if fitted else 0.0,
+            "calibration_rank_deficient": bool(fitted and self._fit_effective_rank < self._fit_n_features),
+            "calibration_posterior_available": bool(fitted and self._fit_posterior_covariance is not None),
+            "low_confidence": bool(
+                fitted and (n_samples < 30 or self._fit_effective_rank < self._fit_n_features)
+            ),
         }
 
     def plan(self, model: nn.Module, config: Any) -> PlacementDecision:
