@@ -686,7 +686,9 @@ class BaseTrainer:
 
             # Validation
             final_epoch = epoch + 1 >= self.epochs
-            validated = self.args.val or final_epoch or self.stopper.possible_stop or self.stop
+            validated = self._sync_validation_gate(
+                self.args.val or final_epoch or self.stopper.possible_stop or self.stop
+            )
             if validated:
                 self._clear_memory(None if self.device.type == "mps" else 0.5)  # prevent VRAM spike
                 if self._recover_before_validation(epoch):
@@ -701,15 +703,22 @@ class BaseTrainer:
             self._finalize_moe_map_saturation_epoch(recovered=False, validated=validated)
 
             self.nan_recovery_attempts = 0
+            rank0_epoch_end_error = None
             if RANK in {-1, 0}:
-                self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
-                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
-                if self.args.time:
-                    self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
+                try:
+                    self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                    self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
+                    if self.args.time:
+                        self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
 
-                # Save model
-                if (self.args.save or final_epoch) and self.save_model():
-                    self.run_callbacks("on_model_save")
+                    # Save model
+                    if (self.args.save or final_epoch) and self.save_model():
+                        self.run_callbacks("on_model_save")
+                except Exception as exc:
+                    if RANK == -1:
+                        raise
+                    rank0_epoch_end_error = f"{type(exc).__name__}: {exc}"
+            self._sync_rank0_epoch_end_result(rank0_epoch_end_error)
 
             # Scheduler
             t = time.time()
@@ -951,6 +960,26 @@ class BaseTrainer:
 
     def _sync_nonfinite_flag(self, local_nonfinite):
         return self._recovery_controller().sync_nonfinite_flag(local_nonfinite)
+
+    def _sync_validation_gate(self, local_validated):
+        """Use rank 0's validation decision so every DDP rank enters the same collectives."""
+        if RANK == -1 or not dist.is_initialized():
+            return bool(local_validated)
+        decision = [bool(local_validated) if RANK == 0 else None]
+        dist.broadcast_object_list(decision, src=0)
+        return bool(decision[0])
+
+    @staticmethod
+    def _sync_rank0_epoch_end_result(rank0_error=None):
+        """Propagate rank-0-only save/callback failures before the next collective."""
+        if RANK == -1 or not dist.is_initialized():
+            if rank0_error:
+                raise RuntimeError(f"Rank 0 epoch-end checkpoint stage failed: {rank0_error}")
+            return
+        result = [rank0_error if RANK == 0 else None]
+        dist.broadcast_object_list(result, src=0)
+        if result[0]:
+            raise RuntimeError(f"Rank 0 epoch-end checkpoint stage failed: {result[0]}")
 
     def _sync_ema_buffers_for_validation(self):
         return self._recovery_controller().sync_ema_buffers()
