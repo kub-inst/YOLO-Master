@@ -337,8 +337,10 @@ class NeckMoAFusion(nn.Module):
     def __deepcopy__(self, memo):
         return robust_deepcopy(self, memo)
 
-def _aux_loss_device(model: nn.Module) -> torch.device:
+def _aux_loss_device(model: nn.Module | None) -> torch.device:
     """Best-effort device lookup for zero aux-loss fallbacks."""
+    if model is None:
+        return torch.device("cpu")
     try:
         return next(model.parameters()).device
     except StopIteration:
