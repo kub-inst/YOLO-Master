@@ -350,14 +350,16 @@ class NeckMoAFusion(nn.Module):
         clone._lo_interpolate_cache = OrderedDict()
         return clone
 
-def _aux_loss_device(model: nn.Module) -> torch.device:
+def _aux_loss_device(model: nn.Module | None) -> torch.device:
     """Best-effort device lookup for zero aux-loss fallbacks."""
+    if model is None:
+        return torch.device("cpu")
     try:
         return next(model.parameters()).device
     except StopIteration:
         return torch.device("cpu")
 
-def collect_moa_aux_loss(model: nn.Module) -> torch.Tensor:
+def collect_moa_aux_loss(model: nn.Module | None) -> torch.Tensor:
     """Sum graph-connected MoA router auxiliary losses without wrapper double-counting.
 
     P2-2 fix: NeckMoAFusion now also updates the ``covered`` set so that if it
@@ -365,6 +367,8 @@ def collect_moa_aux_loss(model: nn.Module) -> torch.Tensor:
     in the iteration order.  This mirrors the pattern used by C2fMoA and makes the
     function robust against future nested architectures.
     """
+    if model is None:
+        return torch.zeros((), device=torch.device("cpu"))
     modules = _cached_moa_topology(model)
     return collect_aux_loss(model, include_kinds=("moa",), device=_aux_loss_device(model), modules=modules)
 
