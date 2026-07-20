@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect real COCO128/MPS calibration data and refit the PEFT Planner.
+"""Collect real calibration data and refit the PEFT Planner.
 
 The runner is manifest-driven and writes one atomic result record after every
 training run, so an interrupted 30+ experiment calibration can be resumed.
@@ -73,6 +73,7 @@ DEFAULT_MODELS = (
     "yolo12s=/Users/gatilin/PycharmProjects/YOLO-Master-v260130/yolo12s.pt",
     "yolo26n=/Users/gatilin/PycharmProjects/YOLO-Master-optim-training-v260615/yolo26n.pt",
 )
+PAPER_DEFAULT_DATA = REPO_ROOT / "ultralytics/cfg/datasets/VOC.yaml"
 RANKS = (4, 8, 16)
 RANK_VARIANTS = ("lora", "dora", "loha")
 RANKLESS_VARIANTS = ("ia3",)
@@ -269,7 +270,11 @@ def run_experiment(spec: ExperimentSpec, args: argparse.Namespace) -> dict[str, 
         "lr0": args.lr0,
         "lrf": args.lrf,
         "weight_decay": args.weight_decay,
+        "momentum": args.momentum,
+        "warmup_epochs": args.warmup_epochs,
+        "close_mosaic": args.close_mosaic,
         "amp": args.amp,
+        "cos_lr": args.cos_lr,
         "error": None,
     }
     model = None
@@ -330,9 +335,11 @@ def run_experiment(spec: ExperimentSpec, args: argparse.Namespace) -> dict[str, 
             "lr0": args.lr0,
             "lrf": args.lrf,
             "weight_decay": args.weight_decay,
+            "momentum": args.momentum,
+            "warmup_epochs": args.warmup_epochs,
+            "close_mosaic": args.close_mosaic,
             "amp": args.amp,
-            "warmup_epochs": 0.0,
-            "close_mosaic": 0,
+            "cos_lr": args.cos_lr,
             "lora_lr_mult": 1.0,
         }
         train_args.update(peft_kwargs(spec))
@@ -406,7 +413,7 @@ def build_calibration_artifacts(results: list[dict[str, Any]], args: argparse.Na
     for record in results:
         if record.get("status") == "success":
             protocol = json.dumps(
-                {key: record.get(key) for key in ("epochs", "imgsz", "batch", "optimizer", "lr0", "amp")},
+                {key: record.get(key) for key in ("epochs", "imgsz", "batch", "optimizer", "lr0", "amp", "cos_lr")},
                 sort_keys=True,
             )
             protocol_counts[protocol] = protocol_counts.get(protocol, 0) + 1
@@ -429,7 +436,7 @@ def build_calibration_artifacts(results: list[dict[str, Any]], args: argparse.Na
                 rank=max(int(record["rank"]), 1),
                 delta_mAP=metric - baseline_metric,
                 model_name=record["model_name"],
-                dataset="COCO128",
+                dataset=record.get("dataset", str(args.data)),
                 epochs=record["epochs"],
                 timestamp=record["finished_at"],
                 notes=record["experiment_id"],
@@ -463,6 +470,7 @@ def build_calibration_artifacts(results: list[dict[str, Any]], args: argparse.Na
     planner = PEFTPlanner()
     planner.fit(collector.to_history(), ranks=collector.to_ranks())
     ordinary_lovo = LOVOValidator().cross_validate(collector.data_points)
+    paper_lovo = LOVOValidator().cross_validate_paper(collector.data_points)
     report.update(
         {
             "status": "fitted",
@@ -471,11 +479,12 @@ def build_calibration_artifacts(results: list[dict[str, Any]], args: argparse.Na
             "fit_metadata": planner._calibration_metadata(),
             "rank_aware_lovo": rank_aware_lovo(collector.data_points),
             "lovo": ordinary_lovo.to_dict(),
+            "paper_lovo": paper_lovo,
         }
     )
     coefficient_payload = {
         "generated_at": report["generated_at"],
-        "dataset": "COCO128",
+        "dataset": str(args.data),
         "device": args.device,
         "coefficients": planner._coeffs,
         "feature_order": [
@@ -492,6 +501,8 @@ def build_calibration_artifacts(results: list[dict[str, Any]], args: argparse.Na
             "log2_rank",
             "phi_attn_squared",
         ],
+        "paper_feature_order": ["intercept", "phi_attn", "phi_text", "phi_dw", "variant_xi"],
+        "paper_coefficients": list(planner._paper_coeffs),
         "fit_metadata": report["fit_metadata"],
         "rank_aware_lovo": {key: value for key, value in report["rank_aware_lovo"].items() if key != "predictions"},
         "sample_count": len(collector),
@@ -504,18 +515,22 @@ def build_calibration_artifacts(results: list[dict[str, Any]], args: argparse.Na
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", action="append", dest="models", help="NAME=/absolute/path.pt; repeatable")
-    parser.add_argument("--data", type=Path, default=REPO_ROOT / "ultralytics/cfg/datasets/coco128.yaml")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--imgsz", type=int, default=160)
-    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--data", type=Path, default=PAPER_DEFAULT_DATA)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="mps")
     parser.add_argument("--optimizer", default="AdamW")
-    parser.add_argument("--lr0", type=float, default=0.001)
+    parser.add_argument("--lr0", type=float, default=0.01)
     parser.add_argument("--lrf", type=float, default=0.01)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
+    parser.add_argument("--momentum", type=float, default=0.937)
+    parser.add_argument("--warmup-epochs", type=float, default=3.0)
+    parser.add_argument("--close-mosaic", type=int, default=10)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--cos-lr", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--project", type=Path, default=REPO_ROOT / "runs/planner_mps_coco128_calibration")
     parser.add_argument("--results", type=Path)
     parser.add_argument("--lovo-output", type=Path)
@@ -551,8 +566,8 @@ def parse_args() -> argparse.Namespace:
     args.data = args.data.expanduser().resolve()
     args.merge_results = [path.expanduser().resolve() for path in args.merge_results]
     args.calibration_protocol = {
-        "main": {"epochs": 1, "imgsz": 160, "batch": 8, "optimizer": "AdamW", "lr0": 0.001},
-        "batch4": {"epochs": 1, "imgsz": 160, "batch": 4, "optimizer": "AdamW", "lr0": 0.001},
+        "main": {"epochs": 300, "imgsz": 640, "batch": 16, "optimizer": "AdamW", "lr0": 0.01, "cos_lr": True},
+        "batch4": {"epochs": 300, "imgsz": 640, "batch": 4, "optimizer": "AdamW", "lr0": 0.01, "cos_lr": True},
         "all": None,
     }[args.protocol]
     return args
