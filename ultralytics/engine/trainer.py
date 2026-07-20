@@ -974,10 +974,30 @@ class BaseTrainer:
     def _reset_non_checkpoint_moe_runtime_state(self):
         return self._recovery_controller().reset_runtime(getattr(self, "model", None))
 
-    def _save_healthy_checkpoint(self, serialized_ckpt):
+    def _save_healthy_checkpoint(self, serialized_ckpt, *, verify_forward=False):
         if not self._check_mox_aux_finite(getattr(self, "model", None)):
             return False
-        return self._recovery_controller().save_healthy(serialized_ckpt)
+        # Check live state before serialization so normal epoch saves do not
+        # deserialize the complete checkpoint and run CPU inference again.
+        model = getattr(self, "model", None)
+        optimizer = getattr(self, "optimizer", None)
+        scaler = getattr(self, "scaler", None)
+        live_state_available = model is not None and optimizer is not None and scaler is not None
+        finite_state = None
+        if live_state_available:
+            finite_state = all(
+                self._state_is_finite(state)
+                for state in (
+                    unwrap_model(model),
+                    getattr(getattr(self, "ema", None), "ema", None),
+                    optimizer.state_dict(),
+                    scaler.state_dict(),
+                )
+                if state is not None
+            )
+        return self._recovery_controller().save_healthy(
+            serialized_ckpt, state_verified=finite_state, verify_forward=verify_forward
+        )
 
     def _bootstrap_healthy_checkpoint(self):
         return self._recovery_controller().bootstrap()
