@@ -29,6 +29,31 @@ def test_adapter_runtime_metadata_can_flow_into_validator_args():
     assert cloned.lora_target_audit == {"selected_count": 1}
 
 
+def test_lora_request_audit_fields_can_flow_into_validator_args():
+    """Safety-audit request fields must not break validator config parsing."""
+    overrides = {
+        "lora_r": 16,
+        "lora_backend": "peft",
+        "lora_use_dora": False,
+        "lora_use_rslora": True,
+        "lora_lr_mult": 2.0,
+        "lora_layer_decay": 0.85,
+        "lora_alpha_warmup": 3,
+        "lora_ortho_weight": 0.5,
+        "requested_lora_use_dora": False,
+        "requested_lora_use_rslora": True,
+        "requested_lora_lr_mult": 2.0,
+        "requested_lora_layer_decay": 0.85,
+        "requested_lora_alpha_warmup": 3,
+        "requested_lora_ortho_weight": 0.5,
+    }
+
+    cloned = get_cfg(overrides=get_cfg(overrides=overrides))
+
+    for key, value in overrides.items():
+        assert getattr(cloned, key) == value
+
+
 def test_custom_config_types_are_validated_additively():
     args = get_cfg(
         overrides={

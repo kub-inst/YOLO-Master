@@ -462,6 +462,16 @@ LORA_RUNTIME_METADATA_KEYS = frozenset(
         "planner_refusal_reason",
         "requested_lora_backend",
         "requested_lora_init_lora_weights",
+        # AdapterRuntimeController records the original request separately
+        # from any safety-adjusted effective value. These audit-only fields
+        # may flow through a copied trainer namespace into validation, but
+        # are not independent YOLO configuration arguments.
+        "requested_lora_alpha_warmup",
+        "requested_lora_layer_decay",
+        "requested_lora_lr_mult",
+        "requested_lora_ortho_weight",
+        "requested_lora_use_dora",
+        "requested_lora_use_rslora",
         "requested_lora_variant",
     }
 )
