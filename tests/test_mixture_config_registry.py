@@ -18,15 +18,24 @@ def test_preserved_config_keys_are_registered_or_upstream_precision_aliases():
 
 def test_adapter_runtime_metadata_can_flow_into_validator_args():
     args = get_cfg(overrides={"lora_r": 2, "lora_backend": "fallback"})
-    args.requested_lora_backend = "fallback"
-    args.effective_lora_backend = "fallback"
-    args.lora_target_audit = {"selected_count": 1}
+    runtime_fields = {
+        "requested_lora_backend": "fallback",
+        "requested_lora_variant": "lora",
+        "requested_lora_init_lora_weights": True,
+        "effective_lora_backend": "fallback",
+        "effective_lora_variant": "lora",
+        "effective_lora_type": "lora",
+        "effective_lora_init_lora_weights": True,
+        "lora_target_audit": {"selected_count": 1},
+    }
+    for key, value in runtime_fields.items():
+        setattr(args, key, value)
 
     cloned = get_cfg(overrides=args)
 
     assert cloned.lora_r == 2
-    assert cloned.effective_lora_backend == "fallback"
-    assert cloned.lora_target_audit == {"selected_count": 1}
+    for key, value in runtime_fields.items():
+        assert getattr(cloned, key) == value
 
 
 def test_lora_request_audit_fields_can_flow_into_validator_args():
