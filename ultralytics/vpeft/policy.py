@@ -311,7 +311,7 @@ class RankAllocator(ABC):
         graph: ComputationGraph,
         placement: torch.Tensor,
         budget: int,
-        variant: str,
+        variant: Union[str, List[str]],
     ) -> torch.Tensor:
         """Allocate ranks to placed modules under a parameter budget.
 
@@ -470,11 +470,14 @@ class GreedyRankAllocator(RankAllocator):
         graph: ComputationGraph,
         placement: torch.Tensor,
         budget: int,
-        variant: str,
+        variant: Union[str, List[str]],
         utilities: Optional[torch.Tensor] = None,  # backward-compat with solver.py
         constraints: Optional[ConstraintRegistry] = None,
     ) -> torch.Tensor:
         N = graph.n_nodes
+        variants = [variant] * N if isinstance(variant, str) else list(variant)
+        if len(variants) != N:
+            raise ValueError("variant list must have one entry per graph node")
         device = placement.device
         r_alloc = torch.zeros(N, dtype=torch.float32, device=device)
 
@@ -487,9 +490,9 @@ class GreedyRankAllocator(RankAllocator):
         for i in placed_indices:
             u_i = self._get_utility(graph, i, utilities)
             for r in self.rank_set:
-                if constraints is not None and not constraints.is_rank_feasible(graph, i, variant, r):
+                if constraints is not None and not constraints.is_rank_feasible(graph, i, variants[i], r):
                     continue
-                cost = int(graph.estimate_params(i, r, variant))
+                cost = int(graph.estimate_params(i, r, variants[i]))
                 if cost <= 0:
                     continue
                 f_r = r_utility_fn(r, self.r_max)
@@ -524,9 +527,11 @@ class GreedyRankAllocator(RankAllocator):
                 for r in sorted(self.rank_set):
                     if r <= current_r:
                         continue
-                    if constraints is not None and not constraints.is_rank_feasible(graph, i, variant, r):
+                    if constraints is not None and not constraints.is_rank_feasible(graph, i, variants[i], r):
                         continue
-                    cost_diff = int(graph.estimate_params(i, r, variant)) - int(graph.estimate_params(i, current_r, variant))
+                    cost_diff = int(graph.estimate_params(i, r, variants[i])) - int(
+                        graph.estimate_params(i, current_r, variants[i])
+                    )
                     if cost_diff <= 0 or B_rem < cost_diff:
                         continue
                     u_i = self._get_utility(graph, i, utilities)

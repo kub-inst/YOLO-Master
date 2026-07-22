@@ -99,6 +99,44 @@ def test_vpeft_alternating_solver_smoke():
     assert 0 < decision.budget_used <= 1_000
 
 
+def test_vpeft_registry_uses_canonical_soft_constraint_names():
+    from ultralytics.vpeft import ComputationGraph, ConstraintRegistry, ModuleNode
+
+    registry = ConstraintRegistry.default({"soft_constraints": ["budget", "deploy"]})
+    assert registry.hard_constraint_names() == [
+        "C_op", "C_sem", "C_budget", "C_deploy", "C_compat", "C_moe", "C_div"
+    ]
+    assert registry.soft_constraint_names() == ["C_budget", "C_deploy"]
+    graph = ComputationGraph(modules=[ModuleNode("backbone.fc", "Linear", 8, 8)])
+    values = registry.evaluate_soft(graph, torch.tensor([1.0]), torch.tensor([4]), ["lora"])
+    assert set(values) == {"C_budget", "C_deploy"}
+
+    soft_only = ConstraintRegistry.default({"hard_constraints": [], "soft_constraints": ["budget"]})
+    assert soft_only.hard_constraint_names() == []
+    assert soft_only.soft_constraint_names() == ["C_budget"]
+
+
+def test_vpeft_ao_budget_accounts_for_per_node_variants():
+    from ultralytics.vpeft import AlternatingOptimizationSolver, ComputationGraph, ConstraintRegistry, ModuleNode
+
+    graph = ComputationGraph(
+        modules=[
+            ModuleNode("backbone.linear", "Linear", 8, 8),
+            ModuleNode("backbone.linear2", "Linear", 64, 64),
+        ]
+    )
+    decision = AlternatingOptimizationSolver(
+        max_iter=2, rank_min=4, rank_max=4, rank_step=4
+    ).solve(graph, budget=10_000, variant="lora", constraints=ConstraintRegistry.default())
+
+    assert len(decision.variants) == graph.n_nodes
+    assert decision.budget_used == sum(
+        graph.estimate_params(index, int(decision.ranks[index]), decision.variants[index])
+        for index in range(graph.n_nodes)
+        if decision.placement[index] > 0.5
+    )
+
+
 def test_vpeft_solver_assigns_only_feasible_grouped_conv_ranks():
     from ultralytics.vpeft import AlternatingOptimizationSolver, ComputationGraphBuilder, ConstraintRegistry
 

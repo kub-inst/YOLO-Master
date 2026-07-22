@@ -156,11 +156,11 @@ class MoEPruner:
         parts = layer_name.split(".")
         return ".".join(parts[:-1]) if len(parts) > 1 else ""
     
-    def _find_projection_layer(
+    def _find_projection_layers(
         self, 
         router: nn.Module, 
         num_experts: int
-    ) -> Optional[Tuple[nn.Module, str]]:
+    ) -> List[Tuple[nn.Module, str]]:
         """
         Find the projection layer in router that outputs to experts
         
@@ -168,30 +168,34 @@ class MoEPruner:
             router: Router module
             num_experts: Original number of experts
             
-        Returns:
-            Tuple of (projection_layer, layer_path) or None if not found
+        Returns every expert-output projection. Gated routers commonly expose
+        more than one branch, and all branches must be sliced before the
+        expert list is changed.
         """
-        # Check common router structures
-        candidates = [
-            ('router', 'router'),
-            ('routing_network', 'routing_network'),
-        ]
-        
-        for attr_name, path_name in candidates:
-            if hasattr(router, attr_name):
-                sequential = getattr(router, attr_name)
-                if isinstance(sequential, nn.Sequential) and len(sequential) > 0:
-                    last_layer = sequential[-1]
-                    
-                    # Check if it's the projection layer
-                    if isinstance(last_layer, nn.Conv2d):
-                        if last_layer.out_channels == num_experts:
-                            return last_layer, f"{path_name}[-1]"
-                    elif isinstance(last_layer, nn.Linear):
-                        if last_layer.out_features == num_experts:
-                            return last_layer, f"{path_name}[-1]"
-        
-        return None
+        found: List[Tuple[nn.Module, str]] = []
+        for path, module in router.named_modules():
+            if not path:
+                continue
+            output_size = getattr(module, "out_channels", None)
+            if output_size is None:
+                output_size = getattr(module, "out_features", None)
+            if not isinstance(module, (nn.Conv2d, nn.Linear)) or output_size != num_experts:
+                continue
+            parent = router
+            if "." in path:
+                parent_path, child_name = path.rsplit(".", 1)
+                parent = router.get_submodule(parent_path)
+            else:
+                child_name = path
+            if isinstance(parent, nn.Sequential) and child_name.isdigit() and int(child_name) != len(parent) - 1:
+                continue
+            found.append((module, path))
+        return found
+
+    def _find_projection_layer(self, router: nn.Module, num_experts: int):
+        """Return the first expert-output projection for legacy callers."""
+        layers = self._find_projection_layers(router, num_experts)
+        return layers[0] if layers else None
     
     def _prune_experts(
         self, 
@@ -205,17 +209,34 @@ class MoEPruner:
             moe_module: MoE module containing experts
             keep_indices: Indices of experts to keep
         """
-        old_experts = moe_module.experts
+        container, attr_name = self._expert_container(moe_module)
+        old_experts = getattr(container, attr_name)
         new_experts = nn.ModuleList([old_experts[i] for i in keep_indices])
-        
-        moe_module.experts = new_experts
+        setattr(container, attr_name, new_experts)
         moe_module.num_experts = len(keep_indices)
+        if hasattr(container, "num_experts"):
+            container.num_experts = len(keep_indices)
+        loss_fn = getattr(moe_module, "moe_loss_fn", None)
+        if loss_fn is not None and hasattr(loss_fn, "num_experts"):
+            loss_fn.num_experts = len(keep_indices)
         
         # Adjust top_k if necessary
         if hasattr(moe_module, 'top_k') and moe_module.top_k > moe_module.num_experts:
             old_top_k = moe_module.top_k
             moe_module.top_k = moe_module.num_experts
             LOGGER.info(f"     📉 Reduced top_k from {old_top_k} to {moe_module.top_k}")
+        if hasattr(container, "top_k"):
+            container.top_k = min(int(container.top_k), len(keep_indices))
+
+    @staticmethod
+    def _expert_container(moe_module: nn.Module) -> Tuple[nn.Module, str]:
+        """Resolve conventional and fused expert containers."""
+        if hasattr(moe_module, "experts"):
+            return moe_module, "experts"
+        fused = getattr(moe_module, "fused_experts", None)
+        if fused is not None and hasattr(fused, "expert_projections"):
+            return fused, "expert_projections"
+        raise RuntimeError("MoE module has no supported expert container")
     
     def _prune_router_weights(
         self, 
@@ -234,46 +255,51 @@ class MoEPruner:
         Returns:
             True if successful, False otherwise
         """
-        result = self._find_projection_layer(router, num_old_experts)
-        
-        if result is None:
+        results = self._find_projection_layers(router, num_old_experts)
+        if not results:
             LOGGER.info(f"     ⚠️  Could not locate router projection layer. "
                   f"Skipping weight pruning.")
             return False
-        
-        proj_layer, layer_path = result
-        LOGGER.info(f"     ✂️  Pruning router projection ({layer_path})")
-        
-        # Create new projection layer with reduced output dimension
-        if isinstance(proj_layer, nn.Conv2d):
-            new_proj = nn.Conv2d(
-                in_channels=proj_layer.in_channels,
-                out_channels=len(keep_indices),
-                kernel_size=proj_layer.kernel_size,
-                stride=proj_layer.stride,
-                padding=proj_layer.padding,
-                bias=(proj_layer.bias is not None)
-            )
-        elif isinstance(proj_layer, nn.Linear):
-            new_proj = nn.Linear(
-                in_features=proj_layer.in_features,
-                out_features=len(keep_indices),
-                bias=(proj_layer.bias is not None)
-            )
-        else:
-            return False
-        
-        # Copy weights for kept experts
-        with torch.no_grad():
-            new_proj.weight.data = proj_layer.weight.data[keep_indices].clone()
-            if proj_layer.bias is not None:
-                new_proj.bias.data = proj_layer.bias.data[keep_indices].clone()
-        
-        # Replace the layer in the sequential container
-        if 'routing_network' in layer_path:
-            router.routing_network[-1] = new_proj
-        elif 'router' in layer_path:
-            router.router[-1] = new_proj
+        for proj_layer, layer_path in results:
+            LOGGER.info(f"     ✂️  Pruning router projection ({layer_path})")
+            if isinstance(proj_layer, nn.Conv2d):
+                new_proj = nn.Conv2d(
+                    in_channels=proj_layer.in_channels,
+                    out_channels=len(keep_indices),
+                    kernel_size=proj_layer.kernel_size,
+                    stride=proj_layer.stride,
+                    padding=proj_layer.padding,
+                    dilation=proj_layer.dilation,
+                    groups=proj_layer.groups,
+                    bias=(proj_layer.bias is not None),
+                    padding_mode=proj_layer.padding_mode,
+                )
+            elif isinstance(proj_layer, nn.Linear):
+                new_proj = nn.Linear(
+                    in_features=proj_layer.in_features,
+                    out_features=len(keep_indices),
+                    bias=(proj_layer.bias is not None),
+                )
+            else:
+                return False
+            with torch.no_grad():
+                new_proj.weight.copy_(proj_layer.weight.data[keep_indices])
+                if proj_layer.bias is not None:
+                    new_proj.bias.copy_(proj_layer.bias.data[keep_indices])
+            if "." in layer_path:
+                parent_path, child_name = layer_path.rsplit(".", 1)
+                parent = router.get_submodule(parent_path)
+            else:
+                parent = router
+                child_name = layer_path
+            if child_name.isdigit():
+                parent[int(child_name)] = new_proj
+            else:
+                setattr(parent, child_name, new_proj)
+
+        prior = getattr(router, "expert_prior", None)
+        if isinstance(prior, nn.Parameter) and prior.numel() == num_old_experts:
+            router.expert_prior = nn.Parameter(prior.data[keep_indices].clone())
         
         # Update router attributes
         router.num_experts = len(keep_indices)
@@ -308,11 +334,14 @@ class MoEPruner:
             moe_module = modules_dict[parent_name]
             
             # Verify MoE structure
-            if not hasattr(moe_module, 'experts') or not hasattr(moe_module, 'routing'):
-                LOGGER.info(f"   ❌ {parent_name} missing 'experts' or 'routing' attributes")
+            if not hasattr(moe_module, 'routing'):
+                LOGGER.info(f"   ❌ {parent_name} missing 'routing' attribute")
                 continue
-            
-            num_old_experts = len(moe_module.experts)
+            try:
+                expert_container, expert_attr = self._expert_container(moe_module)
+            except RuntimeError:
+                raise RuntimeError(f"Cannot prune {parent_name}: missing a supported expert container.")
+            num_old_experts = len(getattr(expert_container, expert_attr))
             
             # Skip if no pruning needed
             if len(keep_indices) == num_old_experts:
@@ -323,15 +352,18 @@ class MoEPruner:
             LOGGER.info(f"     Experts: {num_old_experts} → {len(keep_indices)} "
                   f"(keeping {keep_indices})")
             
-            # Prune experts
-            self._prune_experts(moe_module, keep_indices)
-            
             # Prune router weights
-            self._prune_router_weights(
+            router_updated = self._prune_router_weights(
                 moe_module.routing, 
                 keep_indices, 
                 num_old_experts
             )
+            if not router_updated:
+                raise RuntimeError(
+                    f"Cannot prune {parent_name}: router has no expert-output projection that can be reduced safely."
+                )
+            # Mutate the expert list only after every router branch is ready.
+            self._prune_experts(moe_module, keep_indices)
         
         LOGGER.info("\n✅ Surgery completed")
         return new_model

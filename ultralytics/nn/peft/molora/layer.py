@@ -613,6 +613,9 @@ class MoLoRALayer(nn.Module):
         mode: str = "ema",
         calibration: Optional[List[float]] = None,
         calibration_metadata: Optional[Dict[str, Any]] = None,
+        *,
+        sync_ema: bool = False,
+        merge_authority: Optional[str] = None,
     ) -> None:
         """Merge all expert deltas into the base layer weight.
 
@@ -623,8 +626,20 @@ class MoLoRALayer(nn.Module):
             raise ValueError("MoLoRA merge mode must be 'ema', 'uniform', or 'calibrated'")
         if self.merged:
             return
+        ema_synchronized = False
         if mode == "ema":
-            weights = self._usage_ema.detach().float().cpu()
+            usage = self._usage_ema.detach().float().clone()
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                if sync_ema:
+                    torch.distributed.all_reduce(usage, op=torch.distributed.ReduceOp.SUM)
+                    usage.div_(torch.distributed.get_world_size())
+                    ema_synchronized = True
+                elif torch.distributed.get_rank() != 0:
+                    raise RuntimeError(
+                        "MoLoRA EMA merge is rank0-only by default; pass sync_ema=True "
+                        "when every rank participates in the merge."
+                    )
+            weights = usage.cpu()
             if not torch.isfinite(weights).all() or float(weights.sum()) <= 0:
                 weights = torch.full((self.num_experts,), 1.0 / self.num_experts)
             else:
@@ -647,7 +662,13 @@ class MoLoRALayer(nn.Module):
                     _merge_linear_delta(self.base_layer.weight, e.lora_A, e.lora_B, e.scaling * weight)
 
         self.merged = True
-        self._merge_metadata = {"mode": mode, "approximate": True, "expert_weights": weights.tolist()}
+        self._merge_metadata = {
+            "mode": mode,
+            "approximate": True,
+            "expert_weights": weights.tolist(),
+            "merge_authority": merge_authority or ("all_ranks" if mode != "ema" or sync_ema else "rank0"),
+            "ema_synchronized": ema_synchronized,
+        }
         if calibration_metadata:
             self._merge_metadata.update(calibration_metadata)
         LOGGER.debug(f"[MoLoRA] Merged {self.num_experts} experts into base layer.")

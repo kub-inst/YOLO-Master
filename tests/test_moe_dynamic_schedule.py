@@ -3,7 +3,10 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
+import torch.nn as nn
 
+from ultralytics.nn.modules.moe.gated import HybridAdaptiveGateMoE
 from ultralytics.nn.modules.moe.modules import ES_MOE, OptimizedMOE
 from ultralytics.nn.modules.moe.pruning import MoEPruner
 from ultralytics.nn.modules.moe.schedule import GiniBalanceScheduler, apply_balance_loss_coeff, usage_gini
@@ -75,3 +78,37 @@ def test_compare_expert_signatures_detects_lora_structure_mismatch():
     assert status == "structure_mismatch"
     assert "reference=2:2/2:2" in note
     assert "candidate=3:3/3:3" in note
+
+
+def test_gated_router_pruning_updates_all_projection_branches_and_forward():
+    pruner = MoEPruner("dummy.pt")
+    module = HybridAdaptiveGateMoE(16, 16, num_experts=4, top_k=2, fused_expert_threshold=2)
+    pruner.model = SimpleNamespace(model=nn.Sequential(module))
+    pruner.pruning_plan = {"0.routing": [0, 2]}
+
+    pruned = pruner._perform_surgery()
+    result = pruned(torch.randn(2, 16, 8, 8))
+    assert result.shape == (2, 16, 8, 8)
+    assert len(pruned[0].fused_experts.expert_projections) == 2
+    assert pruned[0].routing.num_experts == 2
+    assert pruned[0].routing.global_fc.out_features == 2
+    assert pruned[0].routing.local_conv[-1].out_channels == 2
+
+
+def test_pruning_fails_fast_when_router_projection_is_missing():
+    class InvalidMoE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_experts = 2
+            self.top_k = 1
+            self.experts = nn.ModuleList([nn.Identity(), nn.Identity()])
+            self.routing = nn.Identity()
+
+        def forward(self, x):
+            return x
+
+    pruner = MoEPruner("dummy.pt")
+    pruner.model = SimpleNamespace(model=nn.Sequential(InvalidMoE()))
+    pruner.pruning_plan = {"0.routing": [0]}
+    with pytest.raises(RuntimeError, match="router has no expert-output projection"):
+        pruner._perform_surgery()

@@ -43,6 +43,14 @@ def test_usage_ema_tracks_final_sparse_top_k_contribution():
     assert torch.equal(layer._usage_ema, torch.tensor([1.0, 0.0]))
 
 
+def test_ema_merge_metadata_declares_rank0_authority():
+    layer = MoLoRALayer(nn.Linear(2, 2), r=1, alpha=1, num_experts=2, top_k=1)
+    layer.merge_weights(mode="ema")
+
+    assert layer._merge_metadata["merge_authority"] == "rank0"
+    assert layer._merge_metadata["ema_synchronized"] is False
+
+
 def test_calibrated_merge_collects_independent_weights_per_layer():
     wrapper = _two_layer_model().eval()
 

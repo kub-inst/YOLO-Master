@@ -139,6 +139,8 @@ class MoLoRABackend:
         if isinstance(model, MoLoRAModel):
             model.merge(
                 mode=mode,
+                sync_ema=kwargs.get("sync_ema", False),
+                merge_authority=kwargs.get("merge_authority"),
                 calibration_data=kwargs.get("calibration_data"),
                 calibration=kwargs.get("calibration"),
                 max_batches=kwargs.get("max_batches"),
@@ -177,7 +179,13 @@ class MoLoRABackend:
                     "calibration_batches": calibration_result["observed_batches"].get(name, 0),
                     "calibration_source": "data" if kwargs.get("calibration_data") is not None else "explicit",
                 }
-            module.merge_weights(mode=mode, calibration=weights, calibration_metadata=metadata)
+            module.merge_weights(
+                mode=mode,
+                calibration=weights,
+                calibration_metadata=metadata,
+                sync_ema=kwargs.get("sync_ema", False),
+                merge_authority=kwargs.get("merge_authority"),
+            )
         return True
 
     def metadata(self, model: nn.Module) -> dict[str, Any]:

@@ -348,6 +348,8 @@ class MoLoRAModel(nn.Module):
         self,
         mode: str = "ema",
         *,
+        sync_ema: bool = False,
+        merge_authority: Optional[str] = None,
         calibration_data: Optional[Iterable[Any]] = None,
         calibration: Optional[Union[List[float], Mapping[str, List[float]]]] = None,
         max_batches: Optional[int] = None,
@@ -387,7 +389,13 @@ class MoLoRAModel(nn.Module):
                     "calibration_batches": observed,
                     "calibration_source": "data" if calibration_data is not None else "explicit",
                 }
-            layer.merge_weights(mode=mode, calibration=weights, calibration_metadata=metadata)
+            layer.merge_weights(
+                mode=mode,
+                calibration=weights,
+                calibration_metadata=metadata,
+                sync_ema=sync_ema,
+                merge_authority=merge_authority,
+            )
         LOGGER.info("[MoLoRA] All layers merged.")
         return result
 
