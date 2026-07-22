@@ -206,3 +206,7 @@ results.csv
 
 # CI test asset cache
 .ultralytics_cache/
+
+# RepoWiki source-only publishing (exclude generator metadata)
+wiki/repowiki/knowledge/
+wiki/repowiki/*/meta/repowiki-metadata.json

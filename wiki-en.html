@@ -10,7 +10,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <link rel="stylesheet" href="./assets/css/style.css">
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.6.0/dist/mermaid.min.js"></script>
+  <script src="./wiki-assets/repowiki.js"></script>
   <style>
     /* Wiki-specific styles */
     .wiki-container { display: flex; height: calc(100vh - 56px); }
@@ -115,7 +117,7 @@
     <div class="app-bar-meta">
       <div class="wiki-lang-toggle">
         <a href="./wiki-en.html" class="active">EN</a>
-        <a href="./wiki-zh.html">中文</a>
+        <a id="alternateLanguage" href="./wiki-zh.html">中文</a>
       </div>
       <a href="https://github.com/Tencent/YOLO-Master" target="_blank" rel="noopener noreferrer">
         <i class="fab fa-github"></i>
@@ -233,7 +235,7 @@ function renderSidebar(categories, container, depth = 0) {
 }
 
 // ---- Load and render a page ----
-async function loadPage(relPath) {
+async function loadPage(relPath, anchor = '') {
   const body = document.getElementById('wikiBody');
   const empty = document.getElementById('wikiEmpty');
   empty.style.display = 'none';
@@ -241,24 +243,27 @@ async function loadPage(relPath) {
   body.innerHTML = '<div class="wiki-loading"><i class="fas fa-spinner fa-spin"></i><p>Loading...</p></div>';
 
   try {
-    const resp = await fetch(CONTENT_BASE + relPath);
+    const signal = repoWiki.abortPrevious();
+    const resp = await fetch(repoWiki.encodedContentUrl(CONTENT_BASE, relPath), { signal });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const md = await resp.text();
-
-    // Strip <cite> blocks (file reference metadata)
-    const cleaned = md.replace(/<cite>[\s\S]*?<\/cite>/gi, '');
-
-    const html = marked.parse(cleaned);
-    body.innerHTML = '<div class="wiki-breadcrumb">' +
-      '<a href="./wiki-en.html">Wiki</a> / ' +
-      escapeHtml(relPath.split('/').slice(0, -1).join(' / ')) +
-      '</div>' + html;
-
-    // Update hash
-    history.replaceState(null, '', '#' + relPath);
-
-    // Scroll to top
-    document.querySelector('.wiki-content-area').scrollTop = 0;
+    const content = repoWiki.sanitize(md);
+    body.replaceChildren();
+    const breadcrumb = document.createElement('div');
+    breadcrumb.className = 'wiki-breadcrumb';
+    breadcrumb.textContent = 'Wiki / ' + relPath.split('/').slice(0, -1).join(' / ');
+    body.append(breadcrumb, content);
+    repoWiki.wire(body, relPath, loadPage);
+    history.replaceState(null, '', repoWiki.route(relPath, anchor));
+    const current = allPages.find(page => page.path === relPath);
+    const alternate = document.getElementById('alternateLanguage');
+    alternate.href = current && current.alternatePath
+      ? './wiki-zh.html' + repoWiki.route(current.alternatePath)
+      : './wiki-zh.html';
+    alternate.title = current && current.alternatePath ? '' : 'Translation unavailable; opening language home';
+    document.querySelectorAll('.wiki-nav-page').forEach(el => el.classList.toggle('active', el.dataset.path === relPath));
+    if (anchor) requestAnimationFrame(() => document.getElementById(anchor)?.scrollIntoView());
+    else document.querySelector('.wiki-content-area').scrollTop = 0;
   } catch (e) {
     body.innerHTML = '<div class="wiki-empty"><i class="fas fa-exclamation-triangle"></i>' +
       '<h2>Failed to load</h2><p>' + escapeHtml(relPath) + '</p></div>';

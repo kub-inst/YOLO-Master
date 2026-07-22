@@ -10,7 +10,9 @@
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <link rel="stylesheet" href="./assets/css/style.css">
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11.6.0/dist/mermaid.min.js"></script>
+  <script src="./wiki-assets/repowiki.js"></script>
   <style>
     /* Wiki-specific styles */
     body { font-family: 'Noto Sans SC', 'Roboto', sans-serif; }
@@ -115,7 +117,7 @@
     </nav>
     <div class="app-bar-meta">
       <div class="wiki-lang-toggle">
-        <a href="./wiki-en.html">EN</a>
+        <a id="alternateLanguage" href="./wiki-en.html">EN</a>
         <a href="./wiki-zh.html" class="active">中文</a>
       </div>
       <a href="https://github.com/Tencent/YOLO-Master" target="_blank" rel="noopener noreferrer">
@@ -230,7 +232,7 @@ function renderSidebar(categories, container, depth = 0) {
 }
 
 // ---- Load and render a page ----
-async function loadPage(relPath) {
+async function loadPage(relPath, anchor = '') {
   const body = document.getElementById('wikiBody');
   const empty = document.getElementById('wikiEmpty');
   empty.style.display = 'none';
@@ -238,19 +240,27 @@ async function loadPage(relPath) {
   body.innerHTML = '<div class="wiki-loading"><i class="fas fa-spinner fa-spin"></i><p>加载中...</p></div>';
 
   try {
-    const resp = await fetch(CONTENT_BASE + relPath);
+    const signal = repoWiki.abortPrevious();
+    const resp = await fetch(repoWiki.encodedContentUrl(CONTENT_BASE, relPath), { signal });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const md = await resp.text();
-
-    const cleaned = md.replace(/<cite>[\s\S]*?<\/cite>/gi, '');
-    const html = marked.parse(cleaned);
-    body.innerHTML = '<div class="wiki-breadcrumb">' +
-      '<a href="./wiki-zh.html">Wiki</a> / ' +
-      escapeHtml(relPath.split('/').slice(0, -1).join(' / ')) +
-      '</div>' + html;
-
-    history.replaceState(null, '', '#' + relPath);
-    document.querySelector('.wiki-content-area').scrollTop = 0;
+    const content = repoWiki.sanitize(md);
+    body.replaceChildren();
+    const breadcrumb = document.createElement('div');
+    breadcrumb.className = 'wiki-breadcrumb';
+    breadcrumb.textContent = 'Wiki / ' + relPath.split('/').slice(0, -1).join(' / ');
+    body.append(breadcrumb, content);
+    repoWiki.wire(body, relPath, loadPage);
+    history.replaceState(null, '', repoWiki.route(relPath, anchor));
+    const current = allPages.find(page => page.path === relPath);
+    const alternate = document.getElementById('alternateLanguage');
+    alternate.href = current && current.alternatePath
+      ? './wiki-en.html' + repoWiki.route(current.alternatePath)
+      : './wiki-en.html';
+    alternate.title = current && current.alternatePath ? '' : '暂无对应翻译，将打开语言首页';
+    document.querySelectorAll('.wiki-nav-page').forEach(el => el.classList.toggle('active', el.dataset.path === relPath));
+    if (anchor) requestAnimationFrame(() => document.getElementById(anchor)?.scrollIntoView());
+    else document.querySelector('.wiki-content-area').scrollTop = 0;
   } catch (e) {
     body.innerHTML = '<div class="wiki-empty"><i class="fas fa-exclamation-triangle"></i>' +
       '<h2>加载失败</h2><p>' + escapeHtml(relPath) + '</p></div>';
@@ -263,6 +273,7 @@ document.getElementById('wikiSearch').addEventListener('input', (e) => {
   const q = e.target.value.toLowerCase().trim();
   const navEl = document.getElementById('wikiNav');
   if (!q) {
+    navEl.replaceChildren();
     renderSidebar(wikiTree.children, navEl);
     return;
   }
@@ -291,6 +302,16 @@ document.getElementById('wikiSearch').addEventListener('input', (e) => {
 // ---- Utils ----
 function escapeHtml(str) {
   const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ---- Init ----
+loadIndex();
+</script>
+</body>
+</html>
+teElement('div');
   div.textContent = str;
   return div.innerHTML;
 }
