@@ -511,4 +511,5 @@ class TestLOVORegressionDrivenDecision:
         assert restored.model_name == "TestModel"
         assert restored.dataset == "COCO128"
         assert restored.epochs == 100
+        assert restored.rank == 8
         assert restored.notes == "test"

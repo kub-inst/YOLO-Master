@@ -204,6 +204,8 @@ MIXTURE_FLOAT_KEYS = frozenset(
         "lora_few_shot_distill_weight_max",
         "lora_few_shot_distill_weight_min",
         "lora_few_shot_dropconnect",
+        "lora_sensitivity_top_ratio",
+        "lora_sensitivity_beta",
         "lora_few_shot_dropconnect_max",
         "lora_few_shot_dropconnect_min",
         "lora_few_shot_ema_decay",
@@ -306,6 +308,9 @@ MIXTURE_INT_KEYS = frozenset(
         "lora_tfinal",
         "lora_tinit",
         "lora_total_step",
+        "lora_adapter_budget",
+        "lora_sensitivity_num_batches",
+        "lora_sensitivity_max_layers",
         "moa_local_window_size",
         "moe_expert_warmup_epochs",
         "moe_map_saturation_window_size",
@@ -368,6 +373,8 @@ MIXTURE_BOOL_KEYS = frozenset(
         "lora_only_3x3",
         "lora_only_backbone",
         "lora_planner_enabled",
+        "lora_sensitivity_select",
+        "lora_sensitivity_keep_risky",
         "lora_save_adapters",
         "lora_skip_stem",
         "lora_use_dora",
@@ -429,6 +436,7 @@ MIXTURE_STR_KEYS = frozenset(
         "lora_quantization",
         "lora_type",
         "lora_variant",
+        "lora_planner_solver",
         "molora_expert_init",
         "molora_router_type",
     }
@@ -440,6 +448,8 @@ LORA_RUNTIME_METADATA_KEYS = frozenset(
         "effective_lora_init_lora_weights",
         "effective_lora_type",
         "effective_lora_variant",
+        "effective_optimizer",
+        "effective_optimizer_lrs",
         "lora_planner_adapted",
         "lora_planner_refused",
         "lora_safety_overrides",
@@ -452,6 +462,16 @@ LORA_RUNTIME_METADATA_KEYS = frozenset(
         "planner_refusal_reason",
         "requested_lora_backend",
         "requested_lora_init_lora_weights",
+        # AdapterRuntimeController records the original request separately
+        # from any safety-adjusted effective value. These audit-only fields
+        # may flow through a copied trainer namespace into validation, but
+        # are not independent YOLO configuration arguments.
+        "requested_lora_alpha_warmup",
+        "requested_lora_layer_decay",
+        "requested_lora_lr_mult",
+        "requested_lora_ortho_weight",
+        "requested_lora_use_dora",
+        "requested_lora_use_rslora",
         "requested_lora_variant",
     }
 )

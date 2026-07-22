@@ -151,6 +151,43 @@ def test_vpeft_solver_assigns_only_feasible_grouped_conv_ranks():
     assert constraints.is_rank_feasible(graph, 0, "lora", int(decision.ranks[0].item()))
 
 
+def test_vpeft_ao_budget_dual_penalty_excludes_negative_density_candidates():
+    from ultralytics.vpeft import AlternatingOptimizationSolver, ComputationGraph, ModuleNode
+
+    graph = ComputationGraph(
+        modules=[
+            ModuleNode("backbone.small", "Linear", 8, 8),
+            ModuleNode("backbone.large", "Linear", 64, 64),
+        ],
+        node_features=torch.ones(2, 8),
+    )
+    solver = AlternatingOptimizationSolver(max_iter=1, rank_min=4, rank_max=4, rank_step=4)
+    class _SoftPenalty:
+        def _node_info_from_graph(self, graph, index):
+            return index
+
+        def compute_penalty_breakdown(self, node_info, variant, rank):
+            return {"latency": 1_000.0 if node_info == 1 else 0.0}
+
+    hard_mask = torch.ones(2, dtype=torch.bool)
+    ranks = torch.tensor([4, 4])
+    utilities = torch.ones(2)
+    placement = solver._optimize_pi(
+        graph,
+        ranks,
+        ["lora", "lora"],
+        2_000,
+        utilities,
+        hard_mask,
+        _SoftPenalty(),
+        {"budget": 0.0, "latency": 1.0, "memory": 0.0, "deploy": 0.0},
+    )
+    # The latency dual makes the large module's density negative.  AO should
+    # therefore retain only the positive-density candidate, not fill budget
+    # with a penalised module.
+    assert placement.tolist() == [1.0, 0.0]
+
+
 def test_vpeft_softplus_penalty_stays_finite_for_large_violations():
     from ultralytics.vpeft.solver import _softplus_penalty
 
@@ -158,6 +195,33 @@ def test_vpeft_softplus_penalty_stays_finite_for_large_violations():
 
     assert torch.isfinite(values).all()
     assert torch.allclose(values, torch.tensor([10.0, 100.0, 1_000.0]))
+
+
+def test_graph_builder_annotates_moe_expert_groups_without_manual_registration():
+    from ultralytics.vpeft import ComputationGraphBuilder, ConstraintRegistry
+
+    class TinyMoE(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.num_experts = 2
+            self.experts = nn.ModuleList([nn.Conv2d(4, 4, 1), nn.Conv2d(4, 4, 1)])
+
+    graph = ComputationGraphBuilder().build(TinyMoE())
+    assert {node.annotations["moe_group"] for node in graph.nodes} == {"experts"}
+    mask = ConstraintRegistry.default({"allow_depthwise": True}).get_hard_mask(
+        graph, "lora", candidate_ranks=[4, 8]
+    )
+    assert mask.tolist() == [True, True]
+
+
+def test_gradient_sensitivity_selector_ranks_real_gradients():
+    from ultralytics.utils.lora.sensitivity import GradientSensitivitySelector
+
+    model = nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 2))
+    loader = [torch.randn(3, 4) for _ in range(2)]
+    report = GradientSensitivitySelector(model, loader, num_batches=2, top_ratio=0.5).select_targets(["0", "2"])
+    assert report.selected_targets == ["2"] or report.selected_targets == ["0"]
+    assert all(layer.score >= 0 for layer in report.layers)
 
 
 def test_vpeft_differentiable_solver_survives_large_budget_violation():

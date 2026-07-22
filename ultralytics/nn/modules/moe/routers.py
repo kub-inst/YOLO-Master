@@ -1,14 +1,13 @@
 # 🐧Please note that this file has been modified by Tencent on 2026/02/07. All Tencent Modifications are Copyright (C) 2026 Tencent.
 """Efficient routers for Mixture-of-Experts models"""
-import json
 import math
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from urllib.request import Request, urlopen
 from typing import Tuple, Optional, Dict
 from .utils import FlopsUtils, get_safe_groups
+from ultralytics.nn.modules._numeric import stable_normalize
+from ultralytics.nn.modules.routing_protocol import routing_finite_diagnostics
 from ultralytics.utils.errors import MoERouterError, ShapeMismatchError
 
 
@@ -49,44 +48,8 @@ def _validate_router_input(x: torch.Tensor, expected_channels: int, context: str
             context=context or "router input",
         )
     if torch.isnan(x).any() or torch.isinf(x).any():
-        #region debug-point router-nonfinite
-        if os.getenv("ULTRA_DEBUG_NONFINITE", ""):
-            try:
-                finite = torch.isfinite(x)
-                nonfinite = (~finite).sum().item()
-                total = x.numel()
-                if finite.any():
-                    x_finite = x[finite]
-                    x_min = float(x_finite.min().item())
-                    x_max = float(x_finite.max().item())
-                else:
-                    x_min = None
-                    x_max = None
-                payload = {
-                    "event": "router_input_nonfinite",
-                    "context": context,
-                    "shape": list(x.shape),
-                    "dtype": str(x.dtype),
-                    "device": str(x.device),
-                    "nonfinite": int(nonfinite),
-                    "total": int(total),
-                    "min": x_min,
-                    "max": x_max,
-                }
-                url = os.getenv("ULTRA_DEBUG_POST_URL", "")
-                if url:
-                    body = json.dumps(payload, separators=(",", ":")).encode()
-                    req = Request(url, data=body, headers={"Content-Type": "application/json"})
-                    urlopen(req, timeout=1.0).close()
-                else:
-                    from ultralytics.utils import LOGGER
-
-                    LOGGER.warning(f"[debug-point router-nonfinite] {payload}")
-            except Exception:
-                pass
-        #endregion debug-point router-nonfinite
         raise MoERouterError(
-            f"Router input contains NaN/Inf values"
+            "Router input contains NaN/Inf values"
             + (f" [{context}]" if context else "")
         )
 
@@ -207,7 +170,7 @@ class BaseRouter(nn.Module):
 
     Capacity factor controls the maximum number of tokens each expert can handle
     per step. When a batch has more tokens than ``capacity_factor * num_experts``,
-    excess tokens are routed to an overflow bucket and handled by default experts.
+    excess tokens are routed to a deterministic round-robin overflow expert.
     This prevents OOM when a single expert gets overloaded.
     """
 
@@ -253,12 +216,17 @@ class BaseRouter(nn.Module):
             max_tokens = int(self.capacity_factor * self.num_experts)
             if B > max_tokens:
                 overflow_mask = torch.zeros(B, dtype=torch.bool, device=logits.device)
-                # Randomly select which tokens get routed normally (first max_tokens)
-                indices = torch.randperm(B, device=logits.device)[:max_tokens]
+                # Use a rank-independent selection so DDP replicas make the
+                # same capacity decision for identical local batch shapes.
+                indices = torch.arange(max_tokens, device=logits.device)
                 overflow_mask[indices] = True
-                # Overflow tokens are sent to the default expert (expert 0).
+                # Spread overflow tokens across experts instead of forcing all
+                # of them onto expert 0, which amplifies load imbalance.
                 topk_indices = topk_indices.clone()
-                topk_indices[~overflow_mask] = 0
+                overflow_indices = torch.nonzero(~overflow_mask, as_tuple=False).flatten()
+                topk_indices[overflow_indices] = (
+                    torch.arange(overflow_indices.numel(), device=logits.device) % self.num_experts
+                ).unsqueeze(1)
                 # Mask routing probabilities before normalization so the
                 # capacity decision cannot be undone by later weighting.
                 topk_vals = topk_vals.masked_fill(~overflow_mask[:, None], 0)
@@ -448,8 +416,15 @@ class DynamicRoutingLayer(nn.Module):
             top_k: Number of active experts; if None uses all experts (Softmax)
         """
         super(DynamicRoutingLayer, self).__init__()
+        if num_experts < 1:
+            raise ValueError(f"num_experts must be positive, got {num_experts}")
+        if reduction < 1:
+            raise ValueError(f"reduction must be positive, got {reduction}")
+        if top_k is not None and not 1 <= top_k <= num_experts:
+            raise ValueError(f"top_k must be in [1, {num_experts}], got {top_k}")
         reduced_channels = max(in_channels // reduction, 8)
 
+        self.in_channels = in_channels
         self.num_experts = num_experts
         self.top_k = min(top_k, num_experts) if top_k is not None else num_experts
         self.use_top_k = (top_k is not None)  # whether to enable Top-K
@@ -464,8 +439,16 @@ class DynamicRoutingLayer(nn.Module):
         )
 
     def forward(self, x):
+        exporting = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+        if not exporting:
+            expected_channels = getattr(self, "in_channels", _get_router_in_channels(self.routing_network))
+            _validate_router_input(x, expected_channels, "DynamicRoutingLayer")
         pooled = self.global_pool(x)
         routing_logits = self.routing_network(pooled)  # [B, num_experts, 1, 1]
+        if not exporting:
+            self.last_routing_diagnostics = routing_finite_diagnostics(logits=routing_logits)
+        if not exporting and not torch.isfinite(routing_logits).all():
+            raise MoERouterError("DynamicRoutingLayer internal output contains NaN/Inf values")
 
         # Choose strategy based on Top-K enablement and train/infer mode
         # Note: Use unified path for ONNX export compatibility.
@@ -476,18 +459,22 @@ class DynamicRoutingLayer(nn.Module):
         # at inference but creates export incompatibility.
         if not self.use_top_k:
             # No Top-K: direct Softmax
-            routing_weights = F.softmax(routing_logits.float(), dim=1).type_as(x)
+            routing_weights = F.softmax(routing_logits.float().clamp(-30.0, 30.0), dim=1).type_as(x)
         else:
             # Training / export: soft Top-K keeps gradient flow and a static
             # graph that traces cleanly for ONNX/TorchScript.
             # Eager-mode inference: hard Top-K gives true sparsity (non-selected
             # experts get exactly 0 weight, identical numerics to soft Top-K's
             # masked renormalisation) so callers can skip those experts.
-            export = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
-            if self.training or export:
+            if self.training or exporting:
                 routing_weights = self._soft_top_k(routing_logits)
             else:
                 routing_weights = self._hard_top_k(routing_logits)
+
+        if not exporting:
+            self.last_routing_diagnostics = routing_finite_diagnostics(
+                logits=routing_logits, probabilities=routing_weights
+            )
 
         return routing_weights.repeat(1, 1, x.size(2), x.size(3))
 
@@ -508,13 +495,16 @@ class DynamicRoutingLayer(nn.Module):
         mask_one_hot = mask_one_hot.permute(0, 2, 1).contiguous().to(weights.dtype)
 
         # Apply mask and re-normalize
-        weights = weights * mask_one_hot
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
+        weights = stable_normalize(weights * mask_one_hot, dim=1)
         
         return weights.view(B, E, H, W)
 
     def _hard_top_k(self, logits):
-        """Inference Top-K with the same numerics as the differentiable path."""
-        # Both paths must rank and normalize the same clamped logits. The only
-        # inference-specific difference is that callers may skip zero-weight experts.
-        return self._soft_top_k(logits)
+        """Inference Top-K without building the training one-hot mask graph."""
+        B, E, H, W = logits.shape
+        weights = F.softmax(logits.reshape(B, E, -1).float().clamp(-30.0, 30.0), dim=1).type_as(logits)
+        values, indices = torch.topk(weights, self.top_k, dim=1)
+        values = stable_normalize(values, dim=1)
+        sparse = torch.zeros_like(weights)
+        sparse.scatter_(1, indices, values)
+        return sparse.view(B, E, H, W)

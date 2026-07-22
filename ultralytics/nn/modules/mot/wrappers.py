@@ -121,6 +121,7 @@ class C2fMoT(nn.Module):
                     "expert_usage": mean_usage,
                     "mean_router_probs": mean_usage,
                     "aux_loss": float(aux_total.detach()),
+                    "finite_diagnostics": [s.get("finite_diagnostics", {}) for s in child_snaps],
                 }
             else:
                 self.last_routing_snapshot = {}
@@ -150,7 +151,17 @@ class C2fMoT(nn.Module):
         return _routing_snapshot(self)
 
     def export_capabilities(self) -> dict:
-        return _export_routing_capabilities(self)
+        capabilities = _export_routing_capabilities(self)
+        eager_sparse = bool(self.m and self.m[0].top_k < MoTBlock.NUM_EXPERTS)
+        capabilities.update(
+            routing_kind="mot",
+            sparse_dispatch=eager_sparse,
+            eager_sparse_dispatch=eager_sparse,
+            sparse_export_limitation=(
+                "C2fMoT eager execution supports Top-K sparse dispatch; ONNX and TorchScript tracing use dense blending."
+            ),
+        )
+        return capabilities
 
     def __deepcopy__(self, memo):
         return robust_deepcopy(self, memo)

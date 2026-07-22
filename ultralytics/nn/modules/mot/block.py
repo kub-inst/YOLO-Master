@@ -5,7 +5,13 @@ import torch.nn as nn
 from typing import Optional, Tuple
 from ultralytics.nn.modules._numeric import should_reduce_ddp
 from ultralytics.nn.modules.utils import get_safe_groups as _safe_groups, robust_deepcopy
-from ultralytics.nn.modules.routing_protocol import export_capabilities as _export_routing_capabilities, publish_aux_loss, routing_snapshot as _routing_snapshot
+from ultralytics.nn.modules.routing_protocol import (
+    export_capabilities as _export_routing_capabilities,
+    graph_connected_finite_zero,
+    publish_aux_loss,
+    routing_finite_diagnostics,
+    routing_snapshot as _routing_snapshot,
+)
 from .experts import _DeformableTransformerExpert, _LocalConvTransformerExpert, _WindowTransformerExpert
 from .router import _MoTRouter, _mot_router_aux_loss
 from ultralytics.utils import LOGGER
@@ -65,7 +71,7 @@ class MoTBlock(nn.Module):
         super().__init__()
         if not 1 <= top_k <= self.NUM_EXPERTS:
             raise ValueError(f"top_k must be in [1, {self.NUM_EXPERTS}], got {top_k}")
-        self.top_k = top_k
+        self._top_k = int(top_k)
         self.balance_loss_coeff = balance_loss_coeff
         self.sparse_train = sparse_train
         self.scene_consistency_coeff = max(float(scene_consistency_coeff), 0.0)
@@ -121,7 +127,19 @@ class MoTBlock(nn.Module):
         """Number of Transformer expert branches."""
         return self.NUM_EXPERTS
 
-    # top_k is already stored as self.top_k (instance attribute).
+    @property
+    def top_k(self) -> int:
+        """Number of Transformer experts active per forward."""
+        return self._top_k
+
+    @top_k.setter
+    def top_k(self, value: int) -> None:
+        value = int(value)
+        if not 1 <= value <= self.NUM_EXPERTS:
+            raise ValueError(f"top_k must be in [1, {self.NUM_EXPERTS}], got {value}")
+        self._top_k = value
+        if hasattr(self, "router"):
+            self.router.top_k = value
 
     @property
     def aux_loss(self) -> torch.Tensor:
@@ -136,7 +154,18 @@ class MoTBlock(nn.Module):
         return _routing_snapshot(self)
 
     def export_capabilities(self) -> dict:
-        return _export_routing_capabilities(self)
+        capabilities = _export_routing_capabilities(self)
+        eager_sparse = self.top_k < self.NUM_EXPERTS
+        capabilities.update(
+            routing_kind="mot",
+            sparse_dispatch=eager_sparse,
+            eager_sparse_dispatch=eager_sparse,
+            sparse_export_limitation=(
+                "MoT eager execution supports Top-K sparse dispatch; ONNX and TorchScript tracing use dense blending "
+                "because expert selection is data-dependent."
+            ),
+        )
+        return capabilities
 
     def __deepcopy__(self, memo):
         return robust_deepcopy(self, memo)
@@ -224,7 +253,7 @@ class MoTBlock(nn.Module):
         if self.training and (
             self.balance_loss_coeff > 0 or self.router_z_loss_coeff > 0 or self.scene_consistency_coeff > 0
         ):
-            aux = _mot_router_aux_loss(
+            aux, finite_diagnostics = _mot_router_aux_loss(
                 weights,
                 router_logits,
                 indices,
@@ -232,13 +261,24 @@ class MoTBlock(nn.Module):
                 self.balance_loss_coeff,
                 self.router_z_loss_coeff,
                 reduce_ddp=should_reduce_ddp(self),
+                return_diagnostics=True,
             )
             scene_consistency = self.router.scene_consistency_loss(weights)
             if self.scene_consistency_coeff > 0:
                 aux = aux + self.scene_consistency_coeff * scene_consistency
+                finite_diagnostics = routing_finite_diagnostics(
+                    logits=router_logits, probabilities=weights, aux_loss=aux
+                )
         else:
             aux = x.new_zeros(())
             scene_consistency = x.new_zeros(())
+            finite_diagnostics = routing_finite_diagnostics(
+                logits=router_logits, probabilities=weights, aux_loss=aux
+            )
+
+        exporting = torch.onnx.is_in_onnx_export() or torch.jit.is_tracing()
+        if self.training and not exporting and not torch.isfinite(aux):
+            aux = graph_connected_finite_zero(weights, router_logits, aux)
 
         self.last_aux_loss = aux
         publish_aux_loss(self, aux, kind="mot", training=self.training)
@@ -256,6 +296,7 @@ class MoTBlock(nn.Module):
                 "scene_stats": self.router.last_scene_stats,
                 "scene_bias": self.router.last_scene_bias,
                 "scene_consistency_loss": float(scene_consistency.detach()),
+                "finite_diagnostics": finite_diagnostics,
             }
 
         return out, aux

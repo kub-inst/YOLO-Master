@@ -18,6 +18,7 @@ from ultralytics.nn.modules.moe.routers import (
     UltraEfficientRouter,
     EfficientSpatialRouter,
     AdaptiveRoutingLayer,
+    DynamicRoutingLayer,
     LocalRoutingLayer,
     _validate_router_input,
 )
@@ -92,6 +93,15 @@ class TestValidateRouterInput:
         x[0, 0, 0, 0] = float("inf")
         with pytest.raises(MoERouterError, match="NaN"):
             _validate_router_input(x, IN_CHANNELS)
+
+    def test_nonfinite_debug_path_never_performs_network_post(self, monkeypatch):
+        import ultralytics.nn.modules.moe.routers as routers
+
+        monkeypatch.setenv("ULTRA_DEBUG_NONFINITE", "1")
+        monkeypatch.setenv("ULTRA_DEBUG_POST_URL", "http://127.0.0.1:9/collect")
+        monkeypatch.setattr(routers, "urlopen", lambda *args, **kwargs: pytest.fail("network post attempted"), raising=False)
+        with pytest.raises(MoERouterError):
+            _validate_router_input(torch.full((1, IN_CHANNELS, 2, 2), float("nan")), IN_CHANNELS)
 
 
 # =============================================================================
@@ -200,6 +210,75 @@ class TestLocalRoutingLayerBoundaries:
         x = torch.randn(2, IN_CHANNELS, 16)
         with pytest.raises(MoERouterError, match="4-D"):
             local_router(x)
+
+
+class TestDynamicRoutingLayerBoundaries:
+    def test_eval_hard_top_k_matches_training_mask_numerics(self):
+        router = DynamicRoutingLayer(IN_CHANNELS, NUM_EXPERTS, top_k=TOP_K)
+        x = _valid_input()
+        logits = router.routing_network(router.global_pool(x))
+
+        assert torch.allclose(router._hard_top_k(logits), router._soft_top_k(logits), atol=1e-6)
+
+    def test_invalid_top_k_raises(self):
+        with pytest.raises(ValueError, match="top_k"):
+            DynamicRoutingLayer(IN_CHANNELS, NUM_EXPERTS, top_k=0)
+
+    def test_legacy_checkpoint_without_in_channels_preserves_output(self):
+        torch.manual_seed(0)
+        router = DynamicRoutingLayer(IN_CHANNELS, NUM_EXPERTS, top_k=TOP_K).eval()
+        x = _valid_input()
+
+        with torch.no_grad():
+            expected = router(x)
+        state_before = {name: tensor.clone() for name, tensor in router.state_dict().items()}
+
+        del router.in_channels
+        with torch.no_grad():
+            actual = router(x)
+
+        assert torch.equal(actual, expected)
+        assert state_before.keys() == router.state_dict().keys()
+        for name, tensor in router.state_dict().items():
+            assert torch.equal(tensor, state_before[name])
+
+    def test_legacy_checkpoint_without_in_channels_still_checks_channels(self):
+        router = DynamicRoutingLayer(IN_CHANNELS, NUM_EXPERTS, top_k=TOP_K)
+        del router.in_channels
+
+        with pytest.raises(ShapeMismatchError):
+            router(torch.randn(2, IN_CHANNELS // 2, 16, 16))
+
+
+def test_capacity_overflow_is_distributed_round_robin():
+    from ultralytics.nn.modules.moe.routers import BaseRouter
+
+    router = BaseRouter(num_experts=4, top_k=1, capacity_factor=0.5)
+    router.train()
+    logits = torch.zeros(12, 4)
+    _, indices, info = router._process_logits(logits, noise_std=0.0, training=True)
+    assert info["overflow_count"] == 10
+    assert set(indices[-10:, 0].tolist()) == {0, 1, 2, 3}
+
+
+def test_capacity_overflow_is_deterministic_across_repeated_calls():
+    from ultralytics.nn.modules.moe.routers import BaseRouter
+
+    router = BaseRouter(num_experts=4, top_k=2, capacity_factor=0.5)
+    logits = torch.zeros(12, 4)
+    first = router._process_logits(logits, noise_std=0.0, training=True)[1]
+    second = router._process_logits(logits, noise_std=0.0, training=True)[1]
+    assert torch.equal(first, second)
+
+    def test_nonfinite_internal_output_raises(self, monkeypatch):
+        router = DynamicRoutingLayer(IN_CHANNELS, NUM_EXPERTS, top_k=TOP_K)
+        monkeypatch.setattr(
+            router.routing_network,
+            "forward",
+            lambda _: torch.full((2, NUM_EXPERTS, 1, 1), float("nan")),
+        )
+        with pytest.raises(MoERouterError, match="internal output"):
+            router(_valid_input())
 
 
 # =============================================================================
