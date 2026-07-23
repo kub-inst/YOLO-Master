@@ -216,6 +216,7 @@ MIXTURE_FLOAT_KEYS = frozenset(
         "lora_oft_eps",
         "lora_orth_reg_weight",
         "lora_ortho_weight",
+        "latent_aux_gain",
         "mixture_aux_budget",
         "moa_aux_gain",
         "moa_aux_loss_coeff",
@@ -437,6 +438,7 @@ MIXTURE_STR_KEYS = frozenset(
         "lora_type",
         "lora_variant",
         "lora_planner_solver",
+        "lora_planner_backend",
         "molora_expert_init",
         "molora_router_type",
     }

@@ -130,6 +130,7 @@ from .moe import (
     VisualEnhancedAdaptiveGateMoE,
 )
 from .mot import C2fMoT, MoTBlock, anneal_mot_temperature, collect_mot_aux_loss
+from .latent_mixture import DenseChannelExpert, LatentMixture, LatentRouter, LatentRoutingContext, MultiScaleLatentMixture
 
 __all__ = (
     "AIFI",
@@ -242,4 +243,9 @@ __all__ = (
     "anneal_mot_temperature",
     "collect_moa_aux_loss",
     "collect_mot_aux_loss",
+    "DenseChannelExpert",
+    "LatentMixture",
+    "LatentRouter",
+    "LatentRoutingContext",
+    "MultiScaleLatentMixture",
 )
