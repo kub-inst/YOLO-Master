@@ -10,6 +10,7 @@ from ultralytics.nn.modules.block import DyC2f, DyMoEBlock
 from ultralytics.nn.modules.moe import (
     A2C2fMoE,
     AdaptiveGateMoE,
+    ContextRefinedLowRankHybridAdaptiveGateMoE,
     DetailAwareLowRankHybridAdaptiveGateMoE,
     DiversifiedExpertMoE,
     ES_MOE,
@@ -28,12 +29,14 @@ from ultralytics.nn.modules.moe import (
 )
 from ultralytics.nn.modules.moe.config import annotate_mixture_yaml_config
 from ultralytics.nn.modules.mot import C2fMoT
+from ultralytics.nn.modules.latent_mixture import LatentMixture
 from ultralytics.utils.ops import make_divisible
 
 
 MIXTURE_MODULES = {
     "A2C2fMoE": A2C2fMoE,
     "AdaptiveGateMoE": AdaptiveGateMoE,
+    "ContextRefinedLowRankHybridAdaptiveGateMoE": ContextRefinedLowRankHybridAdaptiveGateMoE,
     "C2fMoA": C2fMoA,
     "C2fMoT": C2fMoT,
     "DetailAwareLowRankHybridAdaptiveGateMoE": DetailAwareLowRankHybridAdaptiveGateMoE,
@@ -53,9 +56,11 @@ MIXTURE_MODULES = {
     "UltimateOptimizedMoE": UltimateOptimizedMoE,
     "UltraOptimizedMoE": UltraOptimizedMoE,
     "VisualEnhancedAdaptiveGateMoE": VisualEnhancedAdaptiveGateMoE,
+    "LatentMixture": LatentMixture,
 }
 MIXTURE_BASE_MODULES = frozenset(MIXTURE_MODULES.values())
 MIXTURE_REPEAT_MODULES = frozenset({A2C2fMoE, C2fMoA, C2fMoT, DyC2f})
+MIXTURE_MULTI_INPUT_MODULES = frozenset({LatentMixture})
 
 
 def get_mixture_module(name: str):
@@ -78,6 +83,18 @@ def adapt_mixture_args(
     max_channels: float,
 ) -> tuple[list[Any], int, int, bool]:
     """Apply upstream width/depth/channel rules to one registered module."""
+    if module in MIXTURE_MULTI_INPUT_MODULES:
+        if not isinstance(from_index, (list, tuple)) or not from_index:
+            raise TypeError(f"{module.__name__} expects a non-empty input index list, got {from_index!r}")
+        if len(from_index) < 1 or any(not isinstance(index, int) for index in from_index):
+            raise TypeError(f"{module.__name__} input indices must be integers, got {from_index!r}")
+        if not args:
+            raise ValueError(f"{module.__name__} requires an output-channel argument")
+        c1 = [channels[index] for index in from_index]
+        c2 = args[0]
+        if c2 != nc:
+            c2 = make_divisible(min(c2, max_channels) * width, 8)
+        return [c1, c2, *args[1:]], c2, 1, False
     if not isinstance(from_index, int):
         raise TypeError(f"{module.__name__} expects one input index, got {from_index!r}")
     if not args:
@@ -128,6 +145,7 @@ __all__ = [
     "MIXTURE_MODULES",
     "MIXTURE_BASE_MODULES",
     "MIXTURE_REPEAT_MODULES",
+    "MIXTURE_MULTI_INPUT_MODULES",
     "adapt_mixture_args",
     "finalize_mixture_module",
     "get_mixture_module",

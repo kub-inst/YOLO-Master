@@ -98,7 +98,7 @@ def anneal_mixture_temperatures(
     *,
     factor: float = 0.97,
     min_temp: float = 0.3,
-    families: Iterable[str] = ("moe", "moa", "mot"),
+    families: Iterable[str] = ("moe", "moa", "mot", "latent"),
 ) -> int:
     """Anneal every enabled mixture router through one protocol-level entry point.
 
@@ -147,7 +147,7 @@ def configure_mixture_temperature_schedule(
     model: nn.Module,
     *,
     external: bool = True,
-    families: Iterable[str] = ("moe", "moa", "mot"),
+    families: Iterable[str] = ("moe", "moa", "mot", "latent"),
 ) -> int:
     """Select trainer-level scheduling and disable conflicting per-forward annealing."""
     family_tokens = tuple(str(item).lower() for item in families)

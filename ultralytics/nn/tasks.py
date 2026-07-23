@@ -13,6 +13,7 @@ import torch.nn as nn
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.mixture_registry import (
     MIXTURE_BASE_MODULES,
+    MIXTURE_MULTI_INPUT_MODULES,
     adapt_mixture_args,
     finalize_mixture_module,
     get_mixture_module,
@@ -241,6 +242,8 @@ class BaseModel(torch.nn.Module):
                 continue
             path = child.__class__.__module__
             if path.startswith(("ultralytics.nn.modules.moe", "ultralytics.nn.peft.molora")):
+                return True
+            if getattr(child, "publishes_aux_loss", False):
                 return True
         return False
 
