@@ -1,4 +1,8 @@
-# Issue #52: MoE 专家剪枝与动态超参数调度
+# Issue #52: MoE 专家剪枝与动态超参数调度（实现指南）
+
+> 完整实验数据、图片、Pareto/Sweet Spot 分析、动态调度对照、场景化建议和 Discussion 草稿见
+> [`reports/issues-52-moe-pruning-dynamic-scheduling.md`](../reports/issues-52-moe-pruning-dynamic-scheduling.md)。
+> 本页仅保留配置与运行入口，避免与正式报告重复。
 
 本文档对应 [Tencent/YOLO-Master Issue #52](https://github.com/Tencent/YOLO-Master/issues/52)。
 完整入口为 `scripts/run_issue52_full.py`；它会执行基线训练（或复用 checkpoint）、五档剪枝、
@@ -46,12 +50,16 @@ yolo/bin/python scripts/run_issue52_full.py \
   --baseline-checkpoint weights/YOLO-Master-EsMoE-N.pt \
   --data VisDrone.yaml \
   --device 0 \
-  --imgsz 640 \
-  --batch 32 \
+  --imgsz 1344 \
+  --batch 36 \
   --thresholds 0.05 0.10 0.15 0.20 0.30 \
   --lora-epochs 10 \
   --skip-existing
 ```
+
+默认 `batch=36, imgsz=1344` 来自 97GB GPU 的实际 coco128 峰值测试：分配/保留显存约为
+`87.28/92.89 GiB`。`batch=128, imgsz=1600` 会触发 OOM 并自动降到 16，因此没有采用表面更大、
+实际会降档的配置。其他显存规格应显式覆盖这两个参数。
 
 不传 `--baseline-checkpoint` 时会先从模型 YAML 训练基线。三组调度实验始终从同一个保存的
 `schedule/initial_state.pt` 开始，避免模型构造阶段随机初始化破坏公平性：

@@ -14,7 +14,7 @@ All hyperparameters are CLI-controllable. Intended to run on a single idle GPU
 Example:
     ./yolo/bin/python scripts/run_issue52_full.py \
         --model-cfg ultralytics/cfg/models/master/v0/det/yolo-master-esmoe-n-visdrone.yaml \
-        --data VisDrone.yaml --device 6 --batch 32 --imgsz 1280 \
+        --data VisDrone.yaml --device 6 --batch 36 --imgsz 1344 \
         --baseline-epochs 100 --schedule-epochs 100
 """
 
@@ -46,6 +46,8 @@ from ultralytics.nn.modules.moe.utils import is_core_moe_block  # noqa: E402
 
 
 DEFAULT_THRESHOLDS = (0.05, 0.10, 0.15, 0.20, 0.30)
+DEFAULT_BATCH = 36
+DEFAULT_IMGSZ = 1344
 PRUNE_FIELDS = (
     "threshold",
     "recovery",
@@ -810,8 +812,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data", default="VisDrone.yaml")
     parser.add_argument("--baseline-checkpoint", type=Path, help="Reuse a trained baseline instead of training one.")
     parser.add_argument("--device", default="6")
-    parser.add_argument("--imgsz", type=int, default=1280)
-    parser.add_argument("--batch", type=int, default=32)
+    parser.add_argument("--imgsz", type=int, default=DEFAULT_IMGSZ)
+    parser.add_argument("--batch", type=int, default=DEFAULT_BATCH)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)

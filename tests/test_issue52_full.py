@@ -10,6 +10,8 @@ import torch.nn as nn
 
 from scripts.run_issue52_full import ROOT
 from scripts.run_issue52_full import (
+    DEFAULT_BATCH,
+    DEFAULT_IMGSZ,
     PRUNE_FIELDS,
     SCHEDULE_VARIANTS,
     _analyze_pruning,
@@ -108,6 +110,7 @@ def test_schedule_summary_uses_gini_trace_and_reports_speedup(tmp_path):
 def test_full_runner_uses_real_gini_dynamic_variant():
     assert SCHEDULE_VARIANTS["dynamic"]["args"]["moe_dynamic_schedule"] == "gini"
     assert SCHEDULE_VARIANTS["baseline"]["args"]["moe_dynamic_schedule"] == "none"
+    assert (DEFAULT_BATCH, DEFAULT_IMGSZ) == (36, 1344)
 
 
 def test_tracker_gini_ignores_nested_lora_router_name_matches():
