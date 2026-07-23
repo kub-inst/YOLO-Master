@@ -113,11 +113,22 @@ class MoEPruner:
             
             experts_to_keep = []
             LOGGER.info(f"\n   Layer: {layer_name}")
-            
-            # Determine which experts to keep based on threshold
-            for expert_id, expert_stats in sorted(stats.items()):
+
+            scored = [
+                (self._expert_score(expert_stats, total_hits), int(expert_id), expert_stats)
+                for expert_id, expert_stats in stats.items()
+            ]
+            scored.sort(key=lambda item: (-item[0], item[1]))
+            threshold_kept = {
+                expert_id for score, expert_id, _ in scored if score >= float(self.threshold)
+            }
+            top_kept = {
+                expert_id for _, expert_id, _ in scored[: max(int(self.keep_top_m or 0), 0)]
+            }
+            keep_set = threshold_kept | top_kept
+            for _, expert_id, expert_stats in sorted(scored, key=lambda item: item[1]):
                 usage_pct = expert_stats.hits / total_hits
-                if usage_pct >= self.threshold:
+                if expert_id in keep_set:
                     experts_to_keep.append(expert_id)
                     LOGGER.info(f"     ✅ Keep E{expert_id} (Usage: {usage_pct:.1%})")
                 else:
@@ -392,6 +403,26 @@ class MoEPruner:
         }
         
         torch.save(checkpoint, output_path)
+        import json
+        from pathlib import Path
+
+        manifest_path = Path(output_path).with_suffix(Path(output_path).suffix + ".prune.json")
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "source_model": str(self.model_path),
+                    "threshold": self.threshold,
+                    "importance_mode": self.importance_mode,
+                    "keep_top_m": self.keep_top_m,
+                    "pruning_plan": self.pruning_plan,
+                    "output_model": str(output_path),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
         LOGGER.info(f"✅ Saved to: {output_path}")
     
     def _verify_model(self, output_path: str) -> bool:
