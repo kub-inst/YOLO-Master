@@ -1,0 +1,17 @@
+# A2 official reproduction overrides for the YOLO-Master v0.1-N VisDrone protocol.
+# All unspecified values inherit from ultralytics/cfg/default.yaml.
+
+task: detect
+mode: train
+model: ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml
+data: ultralytics/cfg/datasets/VisDrone.yaml
+epochs: 120
+patience: 0
+batch: 16
+workers: 0
+imgsz: 800
+
+# Validate the complete VisDrone validation split (548 images).
+val: True
+split: val
+fraction: 1.0
