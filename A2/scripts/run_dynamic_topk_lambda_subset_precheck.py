@@ -122,6 +122,19 @@ def train_variant(data: Path, lambda_value: float) -> Path:
     return RUNS_ROOT / name
 
 
+def resume_or_train(data: Path, lambda_value: float) -> Path:
+    """Resume an interrupted variant when a healthy checkpoint exists, otherwise start it once."""
+    run_dir = RUNS_ROOT / variant_name(lambda_value)
+    last_checkpoint = run_dir / "weights" / "last.pt"
+    if last_checkpoint.is_file():
+        print(f"Resuming {run_dir.name} from {last_checkpoint.name}.", flush=True)
+        YOLO(str(last_checkpoint)).train(resume=str(last_checkpoint))
+        return run_dir
+    if run_dir.exists():
+        raise FileExistsError(f"Cannot safely restart incomplete run without {last_checkpoint}: {run_dir}")
+    return train_variant(data, lambda_value)
+
+
 def evaluate_variant(data: Path, run_dir: Path) -> Path:
     """Evaluate every checkpoint only against the registered validation subset."""
     output = run_dir / "checkpoint_area_metrics.json"
@@ -165,6 +178,22 @@ def aps_series(metrics_path: Path) -> list[float]:
     return [100.0 * record["coco_max_dets_100"]["AP_small"] for record in records]
 
 
+def completed_entry(lambda_value: float) -> dict | None:
+    """Return an already-evaluated variant summary, or None when it still needs work."""
+    metrics = RUNS_ROOT / variant_name(lambda_value) / "checkpoint_area_metrics.json"
+    if not metrics.is_file():
+        return None
+    aps = aps_series(metrics)
+    return {
+        "variant": variant_name(lambda_value),
+        "lambda": lambda_value,
+        "mean_aps": sum(aps) / len(aps),
+        "best_aps": max(aps),
+        "status": "completed",
+        "aps": aps,
+    }
+
+
 def write_summary(entries: list[dict]) -> None:
     """Persist completed precheck results after each candidate."""
     RUNS_ROOT.mkdir(parents=True, exist_ok=True)
@@ -190,16 +219,18 @@ def plot_all(entries: list[dict]) -> None:
 
 def main() -> None:
     """Run all six lambda candidates; this precheck intentionally has no baseline or early-stop gate."""
-    if RUNS_ROOT.exists():
-        raise FileExistsError(f"Refusing to overwrite existing run root: {RUNS_ROOT}")
     data = write_subset()
     entries = []
     for lambda_value in LAMBDAS:
-        metrics = evaluate_variant(data, train_variant(data, lambda_value))
+        entry = completed_entry(lambda_value)
+        if entry is not None:
+            print(f"Skipping completed {entry['variant']}.", flush=True)
+            entries.append(entry)
+            write_summary(entries)
+            continue
+        metrics = evaluate_variant(data, resume_or_train(data, lambda_value))
         aps = aps_series(metrics)
-        entries.append(
-            {"variant": variant_name(lambda_value), "lambda": lambda_value, "mean_aps": sum(aps) / len(aps), "best_aps": max(aps), "status": "completed", "aps": aps}
-        )
+        entries.append({"variant": variant_name(lambda_value), "lambda": lambda_value, "mean_aps": sum(aps) / len(aps), "best_aps": max(aps), "status": "completed", "aps": aps})
         write_summary(entries)
         print(f"{entries[-1]['variant']}: mean APs={entries[-1]['mean_aps']:.3f} points", flush=True)
     plot_all(entries)
