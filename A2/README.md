@@ -17,6 +17,7 @@
 ```bash
 python examples/YOLO-Master-EsMoE-VisDrone-Edge/scripts/train_visdrone.py \
     --model yolo26n.pt \
+    --data A2/configs/visdrone.yaml \
     --epochs 1 \
     --batch 2 \
     --device 0 \
