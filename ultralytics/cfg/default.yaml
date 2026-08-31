@@ -161,6 +161,14 @@ box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) classification loss gain
 cls_pw: 0.0 # (float) class weights power for handling class imbalance (0.0=disable, 1.0=full inverse frequency)
 dfl: 1.5 # (float) distribution focal loss gain
+assignment_stats: False # (bool) record per-epoch TAL/STAL positive-assignment statistics during training
+assignment_small_area: 1024.0 # (float) training-input pixel-area upper bound for small GTs (32^2)
+assignment_medium_area: 9216.0 # (float) training-input pixel-area upper bound for medium GTs (96^2)
+tal_topk: 10 # (int) top-k for TAL positive sample selection per GT
+tal_alpha: 0.5 # (float) TAL alignment metric exponent for classification score
+tal_beta: 6.0 # (float) TAL alignment metric exponent for IoU
+tal_dynamic_topk_small: False # (bool) use K=ceil(tal_dynamic_topk_lambda*x) for small GTs, with x expanded-box candidates
+tal_dynamic_topk_lambda: 0.8 # (float) dynamic TopK ratio for small GTs, constrained to [0, 1]
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 rle: 1.0 # (float) rle loss gain (pose tasks)
