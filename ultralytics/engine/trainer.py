@@ -670,6 +670,7 @@ class BaseTrainer:
             self.mixture_controller.begin_epoch(epoch)
             self.adapter_controller.begin_epoch(epoch)
             self.run_callbacks("on_train_epoch_start")
+            self._reset_assignment_stats()
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()
@@ -807,6 +808,7 @@ class BaseTrainer:
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 
             self.run_callbacks("on_train_epoch_end")
+            assignment_metrics = self._collect_assignment_metrics()
             if RANK in {-1, 0}:
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
@@ -833,6 +835,8 @@ class BaseTrainer:
                     foundation_metrics = self._mean_foundation_metrics(prefix="train/")
                     if foundation_metrics:
                         self.metrics = {**(self.metrics or {}), **foundation_metrics}
+                    if assignment_metrics:
+                        self.metrics = {**(self.metrics or {}), **assignment_metrics}
                     self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                     self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                     if self.args.time:
@@ -1291,6 +1295,44 @@ class BaseTrainer:
             for key, value in self.foundation_metric_totals.items()
         }
 
+    def _reset_assignment_stats(self) -> None:
+        """Discard stale validation counters before collecting a training epoch."""
+        criterion = getattr(unwrap_model(self.model), "criterion", None)
+        reset = getattr(criterion, "reset_assignment_stats", None)
+        if callable(reset):
+            reset()
+
+    def _collect_assignment_metrics(self) -> dict[str, float]:
+        """Collect and reduce raw TAL/STAL counters, then derive interpretable epoch metrics."""
+        criterion = getattr(unwrap_model(self.model), "criterion", None)
+        snapshot = getattr(criterion, "assignment_stats", None)
+        if not callable(snapshot) or not (raw := snapshot()):
+            return {}
+
+        reduced = {}
+        for key, value in raw.items():
+            value = value.detach().clone().to(self.device)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(value, op=dist.ReduceOp.SUM)
+            reduced[f"assign/{key}"] = float(value.item())
+
+        metrics = dict(reduced)
+        branches = {key.split("/")[1] for key in reduced if key.count("/") >= 2}
+        for branch in sorted(branches):
+            base = f"assign/{branch}"
+            gt_total = reduced.get(f"{base}/gt_total", 0.0)
+            pos_total = reduced.get(f"{base}/pos_total", 0.0)
+            zero_gt = reduced.get(f"{base}/zero_gt", 0.0)
+            metrics[f"{base}/pos_per_gt"] = pos_total / max(gt_total, 1.0)
+            metrics[f"{base}/zero_gt_rate"] = zero_gt / max(gt_total, 1.0)
+            for size in ("small", "medium", "large"):
+                gt = reduced.get(f"{base}/gt_{size}", 0.0)
+                pos = reduced.get(f"{base}/pos_{size}", 0.0)
+                zero = reduced.get(f"{base}/zero_{size}", 0.0)
+                metrics[f"{base}/pos_per_gt_{size}"] = pos / max(gt, 1.0)
+                metrics[f"{base}/zero_gt_rate_{size}"] = zero / max(gt, 1.0)
+        return metrics
+
     def set_model_attributes(self):
         """Set or update model parameters before training."""
         self.model.names = self.data["names"]
@@ -1443,7 +1485,7 @@ class BaseTrainer:
                     if not adapter_active:
                         raise
                     LOGGER.warning("[PEFT] Resume optimizer state is incompatible; using the initialized optimizer.")
-        if ckpt.get("scaler") is not None:
+        if ckpt.get("scaler") is not None and len(ckpt["scaler"]) > 0:
             self.scaler.load_state_dict(ckpt["scaler"])
         self.optimizer_steps = int(ckpt.get("optimizer_steps", getattr(self, "optimizer_steps", 0)))
         if self.ema and ckpt.get("ema"):

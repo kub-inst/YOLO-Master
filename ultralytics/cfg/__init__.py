@@ -261,6 +261,9 @@ MIXTURE_FLOAT_KEYS = frozenset(
         "objectness_threshold",
         "overlap_ratio",
         "sigma",
+        "tal_alpha",
+        "tal_beta",
+        "tal_dynamic_topk_lambda",
     }
 )
 # fmt: off
@@ -270,6 +273,8 @@ CFG_FLOAT_KEYS = frozenset(
         "box",
         "cls",
         "dfl",
+        "assignment_small_area",
+        "assignment_medium_area",
         "dis",
         "foundation_cosine_weight",
         "foundation_foreground_weight",
@@ -357,6 +362,7 @@ MIXTURE_INT_KEYS = frozenset(
         "foundation_align_dim",
         "foundation_relation_samples",
         "slice_size",
+        "tal_topk",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -465,6 +471,8 @@ CFG_BOOL_KEYS = frozenset(
         "profile",
         "end2end",
         "cls_remap",
+        "assignment_stats",
+        "tal_dynamic_topk_small",
         "foundation_cache_teacher_features",
         "foundation_enabled",
         "foundation_foreground_weighting",

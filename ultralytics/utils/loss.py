@@ -345,12 +345,33 @@ class KeypointLoss(nn.Module):
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
 
+    _ASSIGNMENT_STAT_NAMES = (
+        "gt_total",
+        "pos_total",
+        "zero_gt",
+        "gt_small",
+        "gt_medium",
+        "gt_large",
+        "pos_small",
+        "pos_medium",
+        "pos_large",
+        "zero_small",
+        "zero_medium",
+        "zero_large",
+    )
+
     def __init__(
         self, model: torch.nn.Module, tal_topk: int = 10, tal_topk2: int | None = None
     ):  # model must be de-paralleled
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
+
+        tal_topk = int(getattr(h, "tal_topk", tal_topk))
+        tal_alpha = float(getattr(h, "tal_alpha", 0.5))
+        tal_beta = float(getattr(h, "tal_beta", 6.0))
+        tal_dynamic_topk_small = bool(getattr(h, "tal_dynamic_topk_small", False))
+        tal_dynamic_topk_lambda = float(getattr(h, "tal_dynamic_topk_lambda", 0.8))
 
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
@@ -360,6 +381,14 @@ class v8DetectionLoss:
         self.no = m.nc + m.reg_max * 4
         self.reg_max = m.reg_max
         self.device = device
+        self.assignment_stats_enabled = bool(getattr(h, "assignment_stats", False))
+        self.assignment_small_area = float(getattr(h, "assignment_small_area", 32.0**2))
+        self.assignment_medium_area = float(getattr(h, "assignment_medium_area", 96.0**2))
+        if self.assignment_small_area <= 0 or self.assignment_medium_area <= self.assignment_small_area:
+            raise ValueError(
+                "assignment area thresholds must satisfy 0 < assignment_small_area < assignment_medium_area"
+            )
+        self._assignment_stats = torch.zeros(len(self._ASSIGNMENT_STAT_NAMES), dtype=torch.long, device=device)
 
         self.use_dfl = m.reg_max > 1
 
@@ -371,13 +400,59 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(
             topk=tal_topk,
             num_classes=self.nc,
-            alpha=0.5,
-            beta=6.0,
+            alpha=tal_alpha,
+            beta=tal_beta,
             stride=self.stride.tolist(),
             topk2=tal_topk2,
+            small_area_threshold=self.assignment_small_area,
+            dynamic_topk_small=tal_dynamic_topk_small,
+            dynamic_topk_lambda=tal_dynamic_topk_lambda,
         )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+    @torch.no_grad()
+    def _update_assignment_stats(
+        self,
+        gt_bboxes: torch.Tensor,
+        mask_gt: torch.Tensor,
+        fg_mask: torch.Tensor,
+        target_gt_idx: torch.Tensor,
+    ) -> None:
+        """Accumulate assignment counts without changing targets, losses, or gradients."""
+        if not self.assignment_stats_enabled or gt_bboxes.shape[1] == 0:
+            return
+
+        valid_gt = mask_gt.squeeze(-1).bool()
+        wh = (gt_bboxes[..., 2:4] - gt_bboxes[..., 0:2]).clamp_min_(0)
+        areas = wh.prod(-1)
+        small = valid_gt & (areas < self.assignment_small_area)
+        medium = valid_gt & (areas >= self.assignment_small_area) & (areas < self.assignment_medium_area)
+        large = valid_gt & (areas >= self.assignment_medium_area)
+
+        positives_per_gt = torch.zeros_like(areas, dtype=torch.long)
+        positives_per_gt.scatter_add_(1, target_gt_idx.long(), fg_mask.long())
+        zero_gt = valid_gt & positives_per_gt.eq(0)
+        bins = (small, medium, large)
+        values = (
+            valid_gt.sum(),
+            fg_mask.sum(),
+            zero_gt.sum(),
+            *(mask.sum() for mask in bins),
+            *((positives_per_gt * mask).sum() for mask in bins),
+            *((zero_gt & mask).sum() for mask in bins),
+        )
+        self._assignment_stats += torch.stack(values).to(self._assignment_stats)
+
+    def assignment_stats(self) -> dict[str, torch.Tensor]:
+        """Return detached raw counters for epoch-level aggregation."""
+        if not self.assignment_stats_enabled:
+            return {}
+        return {name: value.detach().clone() for name, value in zip(self._ASSIGNMENT_STAT_NAMES, self._assignment_stats)}
+
+    def reset_assignment_stats(self) -> None:
+        """Reset raw assignment counters before a new training epoch."""
+        self._assignment_stats.zero_()
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
@@ -437,7 +512,9 @@ class v8DetectionLoss:
             gt_labels,
             gt_bboxes,
             mask_gt,
+            stride_tensor=stride_tensor,
         )
+        self._update_assignment_stats(gt_bboxes, mask_gt, fg_mask, target_gt_idx)
 
         target_scores_sum = max(target_scores.sum(), 1)
 
@@ -1016,13 +1093,18 @@ class v8OBBLoss(v8DetectionLoss):
     def __init__(self, model: torch.nn.Module, tal_topk=10, tal_topk2: int | None = None):
         """Initialize v8OBBLoss with model, assigner, and rotated bbox loss; model must be de-paralleled."""
         super().__init__(model, tal_topk=tal_topk)
+        h = self.hyp
+        tal_topk = int(getattr(h, "tal_topk", tal_topk))
+        tal_alpha = float(getattr(h, "tal_alpha", 0.5))
+        tal_beta = float(getattr(h, "tal_beta", 6.0))
         self.assigner = RotatedTaskAlignedAssigner(
             topk=tal_topk,
             num_classes=self.nc,
-            alpha=0.5,
-            beta=6.0,
+            alpha=tal_alpha,
+            beta=tal_beta,
             stride=self.stride.tolist(),
             topk2=tal_topk2,
+            small_area_threshold=self.assignment_small_area,
         )
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
 
@@ -1089,6 +1171,7 @@ class v8OBBLoss(v8DetectionLoss):
             gt_labels,
             gt_bboxes,
             mask_gt,
+            stride_tensor=stride_tensor,
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
@@ -1195,6 +1278,19 @@ class E2EDetectLoss:
         loss_one2one = self.one2one(one2one, batch)
         return loss_one2many[0] + loss_one2one[0], loss_one2many[1] + loss_one2one[1]
 
+    def assignment_stats(self) -> dict[str, torch.Tensor]:
+        """Return assignment counters for both end-to-end branches."""
+        return {
+            f"{branch}/{key}": value
+            for branch, loss in (("o2m", self.one2many), ("o2o", self.one2one))
+            for key, value in loss.assignment_stats().items()
+        }
+
+    def reset_assignment_stats(self) -> None:
+        """Reset assignment counters for both end-to-end branches."""
+        self.one2many.reset_assignment_stats()
+        self.one2one.reset_assignment_stats()
+
 
 class E2ELoss:
     """Criterion class for computing training losses for end-to-end detection."""
@@ -1219,6 +1315,19 @@ class E2ELoss:
         loss_one2many = self.one2many.loss(one2many, batch)
         loss_one2one = self.one2one.loss(one2one, batch)
         return loss_one2many[0] * self.o2m + loss_one2one[0] * self.o2o, loss_one2one[1]
+
+    def assignment_stats(self) -> dict[str, torch.Tensor]:
+        """Return assignment counters for both end-to-end branches."""
+        return {
+            f"{branch}/{key}": value
+            for branch, loss in (("o2m", self.one2many), ("o2o", self.one2one))
+            for key, value in loss.assignment_stats().items()
+        }
+
+    def reset_assignment_stats(self) -> None:
+        """Reset assignment counters for both end-to-end branches."""
+        self.one2many.reset_assignment_stats()
+        self.one2one.reset_assignment_stats()
 
     def update(self) -> None:
         """Update the weights for one-to-many and one-to-one losses based on the decay schedule."""

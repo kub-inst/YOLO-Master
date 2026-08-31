@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "D:\\coding\\datasets",
+  "weights_dir": "D:\\coding\\YOLO-Master\\weights",
+  "runs_dir": "D:\\coding\\YOLO-Master\\runs",
+  "uuid": "45a6f9d48e0a804239b03306a4afb552ed35bdf59fd4193ec47f70aca1598a38",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}
