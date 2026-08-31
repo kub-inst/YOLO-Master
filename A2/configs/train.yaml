@@ -6,6 +6,7 @@ data: configs/visdrone.yaml      # VisDrone2019-DET, 10 classes
 
 # Training
 epochs: 1
+patience: 0                     # disable early stopping; every A2 run completes its declared epochs
 imgsz: 640
 batch: 2
 device: 0                        # single GPU
@@ -22,7 +23,7 @@ warmup_epochs: 3.0
 warmup_momentum: 0.8
 warmup_bias_lr: 0.1
 
-# Augmentation (disabled for smoke test)
+# Augmentation (enabled for full training; set mosaic=0.0 mixup=0.0 for smoke test)
 mosaic: 1.0
 mixup: 0.1
 hsv_h: 0.015
