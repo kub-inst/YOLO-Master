@@ -1,0 +1,15 @@
+# A2 official baseline reproduction overrides. Unspecified values inherit from
+# ultralytics/cfg/default.yaml.
+task: detect
+mode: train
+model: ultralytics/cfg/models/master/v0_1/det/yolo-master-n.yaml
+data: ultralytics/cfg/datasets/VisDrone.yaml
+epochs: 120
+patience: 0
+batch: 4
+# origin bath=16, downgrade for local device
+workers: 0
+imgsz: 800
+val: True
+split: val
+fraction: 1.0

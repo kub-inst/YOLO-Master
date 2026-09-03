@@ -1,0 +1,39 @@
+status: degraded_baseline
+official_reproduction: false
+complete: false
+
+experiment:
+  model: YOLO-Master-v0.1-N
+  dataset: VisDrone2019-DET
+  imgsz: 800
+  planned_epochs: 120
+  completed_epochs: 64
+  validation_images: 548
+
+batch_protocol:
+  planned_batch: 16
+  attempted_batches: [16, 8, 4]
+  effective_batch: 4
+  nbs: 64
+  approximate_accumulation_steps: 16
+  strict_equivalence_to_batch16: false
+
+degradation_reasons:
+  - CUDA OOM caused automatic physical-batch reduction from 16 to 8 to 4.
+  - Training stopped after 64 of 120 planned epochs.
+
+primary_run: runs/baseline_gpu6g_retry
+failed_start_artifacts:
+  - runs/baseline_gpu6g
+  - runs/baseline_gpu6g_restart
+
+allowed_uses:
+  - exploratory convergence analysis
+  - constrained-memory diagnostics
+  - checkpoint and pipeline inspection
+
+disallowed_claims:
+  - official batch-16 reproduction
+  - completed 120-epoch baseline
+  - strict equivalence to physical batch 16
+

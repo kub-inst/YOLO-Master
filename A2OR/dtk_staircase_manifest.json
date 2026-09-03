@@ -1,0 +1,69 @@
+{
+  "protocol": "A2OR matched batch-4 DTK staircase",
+  "variants": [
+    {
+      "variant": "baseline_fixedk10",
+      "dynamic_topk_small": false,
+      "lambda": null,
+      "run_dir": "D:\\coding\\YOLO-Master\\A2OR\\runs\\baseline_fixedk10_vd10pct_s42_20e_b4_w1",
+      "config": "D:\\coding\\YOLO-Master\\A2OR\\baseline_fixedk10_vd10pct_s42_20e_b4_w1.yaml",
+      "log": "D:\\coding\\YOLO-Master\\A2OR\\baseline_fixedk10_vd10pct_s42_20e_b4_w1_console.log",
+      "area_metrics": "D:\\coding\\YOLO-Master\\A2OR\\runs\\baseline_fixedk10_vd10pct_s42_20e_b4_w1\\checkpoint_area_metrics.json"
+    },
+    {
+      "variant": "dtk_lambda0p5",
+      "dynamic_topk_small": true,
+      "lambda": 0.5,
+      "run_dir": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p5_vd10pct_s42_20e_b4_w1",
+      "config": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p5_vd10pct_s42_20e_b4_w1.yaml",
+      "log": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p5_vd10pct_s42_20e_b4_w1_console.log",
+      "area_metrics": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p5_vd10pct_s42_20e_b4_w1\\checkpoint_area_metrics.json"
+    },
+    {
+      "variant": "dtk_lambda0p55",
+      "dynamic_topk_small": true,
+      "lambda": 0.55,
+      "run_dir": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p55_vd10pct_s42_20e_b4_w1",
+      "config": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p55_vd10pct_s42_20e_b4_w1.yaml",
+      "log": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p55_vd10pct_s42_20e_b4_w1_console.log",
+      "area_metrics": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p55_vd10pct_s42_20e_b4_w1\\checkpoint_area_metrics.json"
+    },
+    {
+      "variant": "dtk_lambda0p6",
+      "dynamic_topk_small": true,
+      "lambda": 0.6,
+      "run_dir": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p6_vd10pct_s42_20e_b4_w1",
+      "config": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p6_vd10pct_s42_20e_b4_w1.yaml",
+      "log": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p6_vd10pct_s42_20e_b4_w1_console.log",
+      "area_metrics": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p6_vd10pct_s42_20e_b4_w1\\checkpoint_area_metrics.json"
+    },
+    {
+      "variant": "dtk_lambda0p65",
+      "dynamic_topk_small": true,
+      "lambda": 0.65,
+      "run_dir": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p65_vd10pct_s42_20e_b4_w1",
+      "config": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p65_vd10pct_s42_20e_b4_w1.yaml",
+      "log": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p65_vd10pct_s42_20e_b4_w1_console.log",
+      "area_metrics": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p65_vd10pct_s42_20e_b4_w1\\checkpoint_area_metrics.json"
+    },
+    {
+      "variant": "dtk_lambda0p7",
+      "dynamic_topk_small": true,
+      "lambda": 0.7,
+      "run_dir": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p7_vd10pct_s42_20e_b4_w1",
+      "config": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p7_vd10pct_s42_20e_b4_w1.yaml",
+      "log": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p7_vd10pct_s42_20e_b4_w1_console.log",
+      "area_metrics": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p7_vd10pct_s42_20e_b4_w1\\checkpoint_area_metrics.json"
+    },
+    {
+      "variant": "dtk_lambda0p75",
+      "dynamic_topk_small": true,
+      "lambda": 0.75,
+      "run_dir": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p75_vd10pct_s42_20e_b4_w1",
+      "config": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p75_vd10pct_s42_20e_b4_w1.yaml",
+      "log": "D:\\coding\\YOLO-Master\\A2OR\\dtk_lambda0p75_vd10pct_s42_20e_b4_w1_console.log",
+      "area_metrics": "D:\\coding\\YOLO-Master\\A2OR\\runs\\dtk_lambda0p75_vd10pct_s42_20e_b4_w1\\checkpoint_area_metrics.json"
+    }
+  ],
+  "failures": []
+}
