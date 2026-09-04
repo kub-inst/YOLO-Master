@@ -6,6 +6,7 @@ import io
 import math
 import os
 import pickle
+import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -217,7 +218,6 @@ class TrainingRecoveryController:
         adapter_controller = getattr(trainer, "adapter_controller", None)
         if adapter_controller is not None:
             adapter_controller.sync_ema_treatment()
-        buffer = io.BytesIO()
         source_model = unwrap_model(trainer.model)
         model = deepcopy(source_model) if include_online_model else None
         ema = deepcopy(unwrap_model(trainer.ema.ema)) if getattr(trainer, "ema", None) else None
@@ -249,31 +249,38 @@ class TrainingRecoveryController:
         if not isinstance(runtime_state, dict):
             raise TypeError("checkpoint_runtime_state() must return a dictionary")
         checkpoint_metadata = checkpoint_runtime_metadata(metadata_model)
-        torch.save(
-            {
-                "epoch": getattr(trainer, "epoch", trainer.start_epoch - 1),
-                "optimizer_steps": int(getattr(trainer, "optimizer_steps", 0)),
-                "best_fitness": trainer.best_fitness,
-                "model": model if include_online_model else None,
-                "ema": ema,
-                "updates": trainer.ema.updates if trainer.ema else 0,
-                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(trainer.optimizer.state_dict())),
-                "scaler": trainer.scaler.state_dict(),
-                "train_args": vars(trainer.args),
-                "train_metrics": {**getattr(trainer, "metrics", {}), "fitness": trainer.fitness},
-                "train_results": trainer.read_results_csv(),
-                "date": datetime.now().isoformat(),
-                "version": __version__,
-                "git": {"root": str(GIT.root), "branch": GIT.branch, "commit": GIT.commit, "origin": GIT.origin},
-                "license": "AGPL-3.0 (https://ultralytics.com/license)",
-                "docs": "https://docs.ultralytics.com",
-                "mixture_checkpoint": checkpoint_metadata,
-                "foundation": checkpoint_metadata.get("foundation"),
-                "runtime_state": runtime_state,
-            },
-            buffer,
-        )
-        return buffer.getvalue()
+        checkpoint = {
+            "epoch": getattr(trainer, "epoch", trainer.start_epoch - 1),
+            "optimizer_steps": int(getattr(trainer, "optimizer_steps", 0)),
+            "best_fitness": trainer.best_fitness,
+            "model": model if include_online_model else None,
+            "ema": ema,
+            "updates": trainer.ema.updates if trainer.ema else 0,
+            "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(trainer.optimizer.state_dict())),
+            "scaler": trainer.scaler.state_dict(),
+            "train_args": vars(trainer.args),
+            "train_metrics": {**getattr(trainer, "metrics", {}), "fitness": trainer.fitness},
+            "train_results": trainer.read_results_csv(),
+            "date": datetime.now().isoformat(),
+            "version": __version__,
+            "git": {"root": str(GIT.root), "branch": GIT.branch, "commit": GIT.commit, "origin": GIT.origin},
+            "license": "AGPL-3.0 (https://ultralytics.com/license)",
+            "docs": "https://docs.ultralytics.com",
+            "mixture_checkpoint": checkpoint_metadata,
+            "foundation": checkpoint_metadata.get("foundation"),
+            "runtime_state": runtime_state,
+        }
+        for attempt in range(4):
+            buffer = io.BytesIO()
+            try:
+                torch.save(checkpoint, buffer)
+                return buffer.getvalue()
+            except (RuntimeError, ValueError) as error:
+                if attempt == 3:
+                    raise
+                LOGGER.warning("Checkpoint serialization attempt %d/4 failed (%s); retrying.", attempt + 1, error)
+                time.sleep((2**attempt) / 2)
+        raise RuntimeError("Checkpoint serialization retry loop exited unexpectedly")
 
     def resync_nonfinite_ema(self) -> bool:
         """Replace poisoned EMA tensors with finite online tensors when structures match."""

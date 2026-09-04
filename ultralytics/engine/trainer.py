@@ -670,6 +670,10 @@ class BaseTrainer:
             self.mixture_controller.begin_epoch(epoch)
             self.adapter_controller.begin_epoch(epoch)
             self.run_callbacks("on_train_epoch_start")
+            criterion = getattr(unwrap_model(self.model), "criterion", None)
+            set_criterion_epoch = getattr(criterion, "set_epoch", None)
+            if callable(set_criterion_epoch):
+                set_criterion_epoch(epoch + 1)
             self._reset_assignment_stats()
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'

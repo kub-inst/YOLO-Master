@@ -118,6 +118,9 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# Local/cloud-resolved dataset YAML and per-checkout dataset-root setting
+A2OR/.runtime_data/
 .idea
 env/
 venv/
@@ -243,3 +246,6 @@ agent/logs/
 
 # Foundation local run records (kept local per repo policy)
 reports/foundation/v0.1/
+
+#path
+A2/

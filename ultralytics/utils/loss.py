@@ -372,6 +372,14 @@ class v8DetectionLoss:
         tal_beta = float(getattr(h, "tal_beta", 6.0))
         tal_dynamic_topk_small = bool(getattr(h, "tal_dynamic_topk_small", False))
         tal_dynamic_topk_lambda = float(getattr(h, "tal_dynamic_topk_lambda", 0.8))
+        tal_dynamic_topk_cap = bool(getattr(h, "tal_dynamic_topk_cap", False))
+        tal_dynamic_topk_min = int(getattr(h, "tal_dynamic_topk_min", 0))
+        tal_dynamic_topk_max = int(getattr(h, "tal_dynamic_topk_max", 0))
+        tal_candidate_expand_0_8 = float(getattr(h, "tal_candidate_expand_0_8", 16.0))
+        tal_candidate_expand_8_16 = float(getattr(h, "tal_candidate_expand_8_16", -1.0))
+        tal_candidate_expand_linear_decay = bool(getattr(h, "tal_candidate_expand_linear_decay", False))
+        tal_candidate_expand_full_epochs = int(getattr(h, "tal_candidate_expand_full_epochs", 60))
+        tal_candidate_expand_decay_epochs = int(getattr(h, "tal_candidate_expand_decay_epochs", 60))
 
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction="none")
@@ -407,9 +415,21 @@ class v8DetectionLoss:
             small_area_threshold=self.assignment_small_area,
             dynamic_topk_small=tal_dynamic_topk_small,
             dynamic_topk_lambda=tal_dynamic_topk_lambda,
+            dynamic_topk_cap=tal_dynamic_topk_cap,
+            dynamic_topk_min=tal_dynamic_topk_min,
+            dynamic_topk_max=tal_dynamic_topk_max,
+            candidate_expand_0_8=tal_candidate_expand_0_8,
+            candidate_expand_8_16=tal_candidate_expand_8_16,
+            candidate_expand_linear_decay=tal_candidate_expand_linear_decay,
+            candidate_expand_full_epochs=tal_candidate_expand_full_epochs,
+            candidate_expand_decay_epochs=tal_candidate_expand_decay_epochs,
         )
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+
+    def set_epoch(self, epoch: int) -> float:
+        """Update epoch-dependent candidate expansion using a one-based epoch index."""
+        return self.assigner.set_epoch(epoch)
 
     @torch.no_grad()
     def _update_assignment_stats(
@@ -1291,6 +1311,11 @@ class E2EDetectLoss:
         self.one2many.reset_assignment_stats()
         self.one2one.reset_assignment_stats()
 
+    def set_epoch(self, epoch: int) -> None:
+        """Propagate epoch-dependent candidate expansion to both detection branches."""
+        self.one2many.set_epoch(epoch)
+        self.one2one.set_epoch(epoch)
+
 
 class E2ELoss:
     """Criterion class for computing training losses for end-to-end detection."""
@@ -1328,6 +1353,11 @@ class E2ELoss:
         """Reset assignment counters for both end-to-end branches."""
         self.one2many.reset_assignment_stats()
         self.one2one.reset_assignment_stats()
+
+    def set_epoch(self, epoch: int) -> None:
+        """Propagate epoch-dependent candidate expansion to both detection branches."""
+        self.one2many.set_epoch(epoch)
+        self.one2one.set_epoch(epoch)
 
     def update(self) -> None:
         """Update the weights for one-to-many and one-to-one losses based on the decay schedule."""

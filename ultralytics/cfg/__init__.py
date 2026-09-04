@@ -275,6 +275,8 @@ CFG_FLOAT_KEYS = frozenset(
         "dfl",
         "assignment_small_area",
         "assignment_medium_area",
+        "tal_candidate_expand_0_8",
+        "tal_candidate_expand_8_16",
         "dis",
         "foundation_cosine_weight",
         "foundation_foreground_weight",
@@ -363,6 +365,10 @@ MIXTURE_INT_KEYS = frozenset(
         "foundation_relation_samples",
         "slice_size",
         "tal_topk",
+        "tal_dynamic_topk_min",
+        "tal_dynamic_topk_max",
+        "tal_candidate_expand_full_epochs",
+        "tal_candidate_expand_decay_epochs",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -389,6 +395,8 @@ CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, 
     "moe_prune_calibration_steps": 1,
     "mot_sparse_train_warmup_steps": 0,
     "mot_local_attn_window": 0,
+    "tal_candidate_expand_full_epochs": 0,
+    "tal_candidate_expand_decay_epochs": 0,
     "foundation_align_dim": 1,
     "foundation_relation_samples": 1,
     "moa_regional_max_kv_tokens": 0,
@@ -473,6 +481,8 @@ CFG_BOOL_KEYS = frozenset(
         "cls_remap",
         "assignment_stats",
         "tal_dynamic_topk_small",
+        "tal_dynamic_topk_cap",
+        "tal_candidate_expand_linear_decay",
         "foundation_cache_teacher_features",
         "foundation_enabled",
         "foundation_foreground_weighting",
@@ -756,6 +766,9 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                         )
                 else:
                     cfg[k] = scheme
+
+    if cfg.get("tal_candidate_expand_linear_decay", False) and cfg.get("tal_candidate_expand_decay_epochs", 0) < 1:
+        raise ValueError("'tal_candidate_expand_decay_epochs' must be >= 1 when linear decay is enabled")
 
 
 def _foundation_transformers_available() -> bool:

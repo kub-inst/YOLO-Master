@@ -40,6 +40,14 @@ class TaskAlignedAssigner(nn.Module):
         small_area_threshold: float = 1024.0,
         dynamic_topk_small: bool = False,
         dynamic_topk_lambda: float = 0.8,
+        dynamic_topk_cap: bool = False,
+        dynamic_topk_min: int = 0,
+        dynamic_topk_max: int = 0,
+        candidate_expand_0_8: float = 16.0,
+        candidate_expand_8_16: float = -1.0,
+        candidate_expand_linear_decay: bool = False,
+        candidate_expand_full_epochs: int = 60,
+        candidate_expand_decay_epochs: int = 60,
     ):
         """Initialize a TaskAlignedAssigner object with customizable hyperparameters.
 
@@ -54,6 +62,17 @@ class TaskAlignedAssigner(nn.Module):
             small_area_threshold (float, optional): GT area threshold for P2 anchor gating (default 1024 = 32x32).
             dynamic_topk_small (bool, optional): Apply dynamic TopK only to small GTs.
             dynamic_topk_lambda (float, optional): Small-GT TopK ratio in K=ceil(lambda*x), where x is candidate count.
+            dynamic_topk_cap (bool, optional): Cap small-GT dynamic K at this assigner's fixed top-k.
+            dynamic_topk_min (int, optional): K_min for bounded small-GT dynamic TopK.
+            dynamic_topk_max (int, optional): K_max for bounded small-GT dynamic TopK; 0 disables it.
+            candidate_expand_0_8 (float, optional): Per-side candidate-box target for original sides in [0, 8).
+                Set to -1 to disable this interval.
+            candidate_expand_8_16 (float, optional): Per-side candidate-box target for original sides in [8, 16).
+                Set to -1 to disable this interval.
+            candidate_expand_linear_decay (bool, optional): Keep full expansion first, then linearly contract to the
+                original candidate box.
+            candidate_expand_full_epochs (int, optional): Number of fully expanded epochs before contraction.
+            candidate_expand_decay_epochs (int, optional): Number of epochs over which expansion strength reaches 0.
         """
         super().__init__()
         self.topk = topk
@@ -67,9 +86,50 @@ class TaskAlignedAssigner(nn.Module):
         self.small_area_threshold = small_area_threshold
         self.dynamic_topk_small = dynamic_topk_small
         self.dynamic_topk_lambda = dynamic_topk_lambda
+        self.dynamic_topk_cap = dynamic_topk_cap
+        self.dynamic_topk_min = dynamic_topk_min
+        self.dynamic_topk_max = dynamic_topk_max
+        self.candidate_expand_0_8 = candidate_expand_0_8
+        self.candidate_expand_8_16 = candidate_expand_8_16
+        self.candidate_expand_linear_decay = candidate_expand_linear_decay
+        self.candidate_expand_full_epochs = candidate_expand_full_epochs
+        self.candidate_expand_decay_epochs = candidate_expand_decay_epochs
+        self.candidate_expand_strength = 1.0
         if self.dynamic_topk_small and not 0.0 <= self.dynamic_topk_lambda <= 1.0:
             raise ValueError("dynamic_topk_lambda must be within [0, 1]")
+        if self.dynamic_topk_min < 0:
+            raise ValueError("dynamic_topk_min must be >= 0")
+        if self.dynamic_topk_max < 0:
+            raise ValueError("dynamic_topk_max must be >= 0")
+        if self.dynamic_topk_max and self.dynamic_topk_min > self.dynamic_topk_max:
+            raise ValueError("dynamic_topk_min must be <= dynamic_topk_max when the maximum is enabled")
+        self._validate_candidate_expand_target("candidate_expand_0_8", self.candidate_expand_0_8, 8.0)
+        self._validate_candidate_expand_target("candidate_expand_8_16", self.candidate_expand_8_16, 16.0)
+        if self.candidate_expand_full_epochs < 0:
+            raise ValueError("candidate_expand_full_epochs must be >= 0")
+        if self.candidate_expand_decay_epochs < 0:
+            raise ValueError("candidate_expand_decay_epochs must be >= 0")
+        if self.candidate_expand_linear_decay and self.candidate_expand_decay_epochs < 1:
+            raise ValueError("candidate_expand_decay_epochs must be >= 1 when linear decay is enabled")
         self._stride_tensor = None
+
+    @staticmethod
+    def _validate_candidate_expand_target(name: str, target: float, interval_upper: float) -> None:
+        """Validate one optional per-side candidate-box expansion target."""
+        if target != -1 and target < interval_upper:
+            raise ValueError(f"{name} must be -1 (disabled) or >= {interval_upper:g}")
+
+    def set_epoch(self, epoch: int) -> float:
+        """Set the one-based training epoch and return the effective candidate-expansion strength."""
+        if epoch < 1:
+            raise ValueError("epoch must be one-based and >= 1")
+        if not self.candidate_expand_linear_decay or epoch <= self.candidate_expand_full_epochs:
+            strength = 1.0
+        else:
+            decay_step = epoch - self.candidate_expand_full_epochs
+            strength = max(1.0 - decay_step / self.candidate_expand_decay_epochs, 0.0)
+        self.candidate_expand_strength = strength
+        return strength
 
     @torch.no_grad()
     def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt, stride_tensor=None):
@@ -279,6 +339,13 @@ class TaskAlignedAssigner(nn.Module):
         small_gt = valid_gt & (gt_wh.prod(-1) < self.small_area_threshold)
         candidate_count = candidate_mask.sum(-1)
         dynamic_k = torch.ceil(candidate_count * self.dynamic_topk_lambda).to(torch.long)
+        if self.dynamic_topk_cap or self.dynamic_topk_max > 0:
+            # Preserve each branch's scope: O2M commonly uses topk=10 while O2O may use topk=1.
+            configured_max = self.dynamic_topk_max or self.topk
+            effective_max = min(configured_max, self.topk)
+            floor_k = min(self.dynamic_topk_min, effective_max)
+            dynamic_k = torch.maximum(dynamic_k, torch.full_like(dynamic_k, floor_k))
+            dynamic_k = torch.minimum(dynamic_k, candidate_count.to(torch.long)).clamp_max(effective_max)
         dynamic_k = torch.where(small_gt, dynamic_k, torch.zeros_like(dynamic_k))
         max_dynamic_k = int(dynamic_k.max().item())
         if max_dynamic_k == 0:
@@ -349,14 +416,24 @@ class TaskAlignedAssigner(nn.Module):
             - Bounding box format: [x_min, y_min, x_max, y_max].
         """
         gt_bboxes_xywh = xyxy2xywh(gt_bboxes)
-        expand_threshold = 8
-        expand_target = 16
-        wh_mask = gt_bboxes_xywh[..., 2:] < expand_threshold
-        gt_bboxes_xywh[..., 2:] = torch.where(
-            (wh_mask * mask_gt).bool(),
-            torch.tensor(expand_target, dtype=gt_bboxes_xywh.dtype, device=gt_bboxes_xywh.device),
-            gt_bboxes_xywh[..., 2:],
-        )
+        original_wh = gt_bboxes_xywh[..., 2:]
+        valid_sides = mask_gt.bool().expand_as(original_wh)
+        expanded_wh = original_wh.clone()
+
+        if self.candidate_expand_0_8 != -1:
+            interval_0_8 = valid_sides & (original_wh < 8)
+            target_0_8 = original_wh + self.candidate_expand_strength * (self.candidate_expand_0_8 - original_wh)
+            expanded_wh = torch.where(
+                interval_0_8, target_0_8, expanded_wh
+            )
+        if self.candidate_expand_8_16 != -1:
+            interval_8_16 = valid_sides & (original_wh >= 8) & (original_wh < 16)
+            target_8_16 = original_wh + self.candidate_expand_strength * (self.candidate_expand_8_16 - original_wh)
+            expanded_wh = torch.where(
+                interval_8_16, target_8_16, expanded_wh
+            )
+
+        gt_bboxes_xywh[..., 2:] = expanded_wh
         gt_bboxes = xywh2xyxy(gt_bboxes_xywh)
 
         lt, rb = gt_bboxes.unsqueeze(2).chunk(2, 3)  # (b, n_boxes, 1, 2) left-top, right-bottom

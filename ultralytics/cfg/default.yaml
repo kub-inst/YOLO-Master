@@ -164,11 +164,19 @@ dfl: 1.5 # (float) distribution focal loss gain
 assignment_stats: False # (bool) record per-epoch TAL/STAL positive-assignment statistics during training
 assignment_small_area: 1024.0 # (float) training-input pixel-area upper bound for small GTs (32^2)
 assignment_medium_area: 9216.0 # (float) training-input pixel-area upper bound for medium GTs (96^2)
+tal_candidate_expand_0_8: 16.0 # (float) per-side candidate-box target for original side [0, 8); -1 disables this interval
+tal_candidate_expand_8_16: -1.0 # (float) per-side candidate-box target for original side [8, 16); -1 preserves baseline
+tal_candidate_expand_linear_decay: False # (bool) keep full expansion first, then linearly restore original sides
+tal_candidate_expand_full_epochs: 0 # (int) fully expanded epochs before contraction; used when linear decay is enabled
+tal_candidate_expand_decay_epochs: 0 # (int) contraction epochs; 0 disables the schedule
 tal_topk: 10 # (int) top-k for TAL positive sample selection per GT
 tal_alpha: 0.5 # (float) TAL alignment metric exponent for classification score
 tal_beta: 6.0 # (float) TAL alignment metric exponent for IoU
 tal_dynamic_topk_small: False # (bool) use K=ceil(tal_dynamic_topk_lambda*x) for small GTs, with x expanded-box candidates
 tal_dynamic_topk_lambda: 0.8 # (float) dynamic TopK ratio for small GTs, constrained to [0, 1]
+tal_dynamic_topk_cap: False # (bool) legacy switch: cap dynamic small-GT K at the assigner's fixed top-k
+tal_dynamic_topk_min: 0 # (int) K_min in bounded small-GT dynamic TopK
+tal_dynamic_topk_max: 0 # (int) K_max in bounded small-GT dynamic TopK; 0 disables the explicit bound
 pose: 12.0 # (float) pose loss gain (pose tasks)
 kobj: 1.0 # (float) keypoint objectness loss gain (pose tasks)
 rle: 1.0 # (float) rle loss gain (pose tasks)
