@@ -2,10 +2,10 @@
 
 Examples:
     python A2OR/train_explicit.py --mode set --data-root D:\\coding\\datasets --dataset VisDrone
-    python A2OR/train_explicit.py --mode baseline --name baseline_explicit
-    python A2OR/train_explicit.py --mode dtk --name dtk_explicit --lambda 0.8 --k-min 3 --k-max 10
-    python A2OR/train_explicit.py --mode dtk-axis --name dtk_axis_explicit --expand-8-16 24
-    python A2OR/train_explicit.py --mode axis --name axis_decay_explicit --expand-8-16 24 \
+    python A2OR/train_explicit.py --name baseline_explicit
+    python A2OR/train_explicit.py --dynamic-topk --name dtk_explicit --lambda 0.8 --k-min 3 --k-max 10
+    python A2OR/train_explicit.py --dynamic-topk --candidate-expand --name dtk_axis_explicit --expand-8-16 24
+    python A2OR/train_explicit.py --candidate-expand --name axis_decay_explicit --expand-8-16 24 \
         --expand-linear-decay --expand-full-epochs 60 --expand-decay-epochs 60
     python A2OR/train_explicit.py --print-config
 
@@ -41,7 +41,7 @@ PERSISTED_FIELDS = {
     "translate", "scale", "shear", "perspective", "flipud", "fliplr", "bgr", "mosaic", "mixup", "cutmix",
     "tal_topk", "tal_alpha", "tal_beta", "lambda_value", "k_min", "k_max", "small_area", "medium_area",
     "expand_0_8", "expand_8_16", "expand_linear_decay", "expand_full_epochs", "expand_decay_epochs",
-    "assignment_stats", "pretrained",
+    "assignment_stats", "pretrained", "dynamic_topk", "candidate_expand",
 }
 
 
@@ -50,19 +50,20 @@ class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescript
 
 
 HELP_EPILOG = """
-Modes:
-  baseline   Standard TAL assignment.
-  dtk        Dynamic TopK for small GTs.
-  axis       Per-side candidate expansion; use --expand-8-16 24 to enable [8,16) expansion.
-  dtk-axis   Dynamic TopK plus per-side candidate expansion.
-  set        Save the complete training configuration without starting training.
+Experiment switches:
+  --dynamic-topk       Enable Dynamic TopK for small GTs.
+  --candidate-expand   Enable per-side candidate expansion.
+  Neither switch is enabled by default, which is the baseline configuration.
+
+Legacy --mode values (still accepted): baseline, dtk, axis, dtk-axis, set.
+Prefer the independent switches above for new experiments.
 
 Linear candidate contraction:
   Add --expand-linear-decay to an axis mode. The expansion stays at full strength
   for --expand-full-epochs, then decreases linearly to zero over
   --expand-decay-epochs. For the requested 60+60 schedule:
 
-  python A2OR/train_explicit.py --mode axis --name stal_axis_decay_60_60 \\
+  python A2OR/train_explicit.py --candidate-expand --name stal_axis_decay_60_60 \\
       --expand-0-8 16 --expand-8-16 24 --expand-linear-decay \\
       --expand-full-epochs 60 --expand-decay-epochs 60
 
@@ -88,8 +89,16 @@ def parse_args() -> argparse.Namespace:
         formatter_class=HelpFormatter,
     )
     parser.add_argument(
-        "--mode", choices=("set", "baseline", "dtk", "axis", "dtk-axis"), default="baseline",
-        help="set paths only, or train baseline, DTK, axis expansion, or DTK plus axis expansion.",
+        "--mode", choices=("set", "baseline", "dtk", "axis", "dtk-axis"), default=None,
+        help="Legacy experiment selector; prefer --dynamic-topk and --candidate-expand.",
+    )
+    parser.add_argument(
+        "--dynamic-topk", action=argparse.BooleanOptionalAction, default=False,
+        help="Enable Dynamic TopK for small ground truths.",
+    )
+    parser.add_argument(
+        "--candidate-expand", action=argparse.BooleanOptionalAction, default=False,
+        help="Enable per-side candidate expansion.",
     )
     parser.add_argument("--name", default=None, help="Run name under --project; generated when omitted.")
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
@@ -179,6 +188,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", default=None, help="Checkpoint path belonging to the selected run directory.")
     parser.add_argument("--print-config", action="store_true", help="Print the effective request and exit without training.")
     args = apply_saved_defaults(parser.parse_args())
+    supplied = {item.split("=", 1)[0] for item in sys.argv[1:] if item.startswith("--")}
+    if args.mode and args.mode != "set":
+        if "--dynamic-topk" not in supplied and "--no-dynamic-topk" not in supplied:
+            args.dynamic_topk = args.mode in {"dtk", "dtk-axis"}
+        if "--candidate-expand" not in supplied and "--no-candidate-expand" not in supplied:
+            args.candidate_expand = args.mode in {"axis", "dtk-axis"}
 
     if args.epochs < 1 or args.batch < 1 or args.nbs < 1 or args.workers < 0:
         parser.error("epochs, batch, and nbs must be positive; workers must be non-negative")
@@ -291,9 +306,10 @@ def make_config(args: argparse.Namespace) -> tuple[dict, Path, Path, Path, Path 
     data = _path(args.data, must_exist=True)
     data, data_root, dataset = resolve_data_yaml(data, args.data_root, args.dataset)
     project = _path(args.project)
-    dynamic = args.mode in {"dtk", "dtk-axis"}
-    axis = args.mode in {"axis", "dtk-axis"}
-    default_name = f"{args.mode}_explicit_{args.epochs}e_b{args.batch}"
+    dynamic = args.dynamic_topk
+    axis = args.candidate_expand
+    variant = "dtk-axis" if dynamic and axis else "dtk" if dynamic else "axis" if axis else "baseline"
+    default_name = f"{variant}_explicit_{args.epochs}e_b{args.batch}"
     name = args.name or default_name
     run_dir = project / name
     resume = _path(args.resume, must_exist=True) if args.resume else None
