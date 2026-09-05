@@ -1,48 +1,62 @@
-"""Compare two VisDrone checkpoints with COCO small-object AP using no A2 imports."""
+"""Compare two sets of VisDrone checkpoints with COCO small-object AP."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import tempfile
 from pathlib import Path
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 SETTINGS_PATH = Path(__file__).resolve().parent / ".runtime_data" / "compare_aps_settings.json"
 VISDRONE_NAMES = (
-    "pedestrian",
-    "people",
-    "bicycle",
-    "car",
-    "van",
-    "truck",
-    "tricycle",
-    "awning-tricycle",
-    "bus",
-    "motor",
+    "pedestrian", "people", "bicycle", "car", "van", "truck", "tricycle", "awning-tricycle", "bus", "motor"
 )
+PATH_FIELDS = {"baseline_dir", "exp_dir", "data", "images", "labels", "output"}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("compare", "set"), default="compare")
-    parser.add_argument("--baseline", type=Path, default=None, help="Baseline checkpoint, e.g. weights/epoch29.pt.")
-    parser.add_argument("--exp", type=Path, default=None, help="Experiment checkpoint from the same training epoch.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare matching checkpoints from two weights directories. "
+            "Use --checkpoint-name for one checkpoint, --epochs for selected epochs, "
+            "or --full for all common epoch*.pt plus best.pt and last.pt."
+        )
+    )
+    parser.add_argument("--mode", choices=("compare", "set"), default="compare", help="compare now, or save parameters for later")
+    parser.add_argument("--baseline-dir", type=Path, default=None, help="Baseline weights directory containing .pt files.")
+    parser.add_argument("--exp-dir", type=Path, default=None, help="Experiment weights directory containing the same .pt names.")
+    parser.add_argument("--checkpoint-name", default=None, help="One shared checkpoint filename, e.g. epoch20.pt or best.pt.")
+    parser.add_argument("--checkpoint-pattern", default=None, help="Filename pattern for --epochs; default: epoch{epoch}.pt")
+    parser.add_argument("--epochs", type=int, nargs="+", default=None, help="Specific epochs to compare, e.g. --epochs 1 5 10 20.")
+    parser.add_argument("--start-epoch", type=int, default=None, help="First epoch for an inclusive epoch range.")
+    parser.add_argument("--end-epoch", type=int, default=None, help="Last epoch for an inclusive epoch range.")
+    parser.add_argument("--full", dest="full", action="store_true", default=None, help="Compare all common epoch*.pt plus common best.pt and last.pt.")
+    parser.add_argument("--no-full", dest="full", action="store_false", help="Disable a saved --full setting.")
+
     parser.add_argument("--data", type=Path, default=None, help="Ultralytics dataset YAML.")
     parser.add_argument("--images", type=Path, default=None, help="Validation images directory.")
     parser.add_argument("--labels", type=Path, default=None, help="Validation YOLO labels directory.")
-    parser.add_argument("--output", type=Path, default=None)
-    parser.add_argument("--imgsz", type=int, default=None)
-    parser.add_argument("--batch", type=int, default=None, help="Evaluation batch size; does not change the metric.")
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--output", type=Path, default=None, help="JSON report path.")
+    parser.add_argument("--imgsz", type=int, default=None, help="Validation image size.")
+    parser.add_argument("--batch", type=int, default=None, help="Evaluation batch size; it does not change the metric.")
+    parser.add_argument("--device", default=None, help="Ultralytics device, e.g. 0 or cpu.")
+    parser.add_argument("--workers", type=int, default=None, help="Validation data-loader workers.")
     parser.add_argument("--max-det", type=int, default=None, help="Maximum detections per image during validation.")
-    parser.add_argument("--print-config", action="store_true", help="Print effective parameters without evaluation.")
+    parser.add_argument("--print-config", action="store_true", help="Print effective parameters and checkpoint pairs without evaluation.")
     args = parser.parse_args()
+
     saved = load_settings()
-    for field in ("baseline", "exp", "data", "images", "labels", "output", "imgsz", "batch", "device", "workers", "max_det"):
+    fields = (
+        "baseline_dir", "exp_dir", "checkpoint_name", "checkpoint_pattern", "epochs", "start_epoch", "end_epoch", "full",
+        "data", "images", "labels", "output", "imgsz", "batch", "device", "workers", "max_det",
+    )
+    for field in fields:
         if getattr(args, field) is None and field in saved:
-            setattr(args, field, Path(saved[field]) if field in {"baseline", "exp", "data", "images", "labels", "output"} else saved[field])
+            value = saved[field]
+            setattr(args, field, Path(value) if field in PATH_FIELDS and value else value)
+
     if args.output is None:
         args.output = Path("A2OR/aps_comparison.json")
     if args.imgsz is None:
@@ -55,6 +69,10 @@ def parse_args() -> argparse.Namespace:
         args.workers = 8
     if args.max_det is None:
         args.max_det = 300
+    if args.checkpoint_pattern is None:
+        args.checkpoint_pattern = "epoch{epoch}.pt"
+    if args.full is None:
+        args.full = False
     return args
 
 
@@ -73,27 +91,75 @@ def load_settings() -> dict:
 def save_settings(args: argparse.Namespace) -> None:
     """Persist the complete comparison configuration."""
     SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    params = {
-        "baseline": str(args.baseline), "exp": str(args.exp), "data": str(args.data),
-        "images": str(args.images), "labels": str(args.labels), "output": str(args.output),
-        "imgsz": args.imgsz, "batch": args.batch, "device": args.device,
-        "workers": args.workers, "max_det": args.max_det,
-    }
+    params = {}
+    for field in (
+        "baseline_dir", "exp_dir", "checkpoint_name", "checkpoint_pattern", "epochs", "start_epoch", "end_epoch", "full",
+        "data", "images", "labels", "output", "imgsz", "batch", "device", "workers", "max_det",
+    ):
+        value = getattr(args, field, None)
+        if value is not None:
+            params[field] = str(value) if isinstance(value, Path) else value
     SETTINGS_PATH.write_text(json.dumps({"params": params}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def validate_args(args: argparse.Namespace) -> None:
-    """Validate required paths and numeric evaluation settings."""
-    required = ("baseline", "exp", "data", "images", "labels")
-    missing = [name for name in required if getattr(args, name) is None]
+def validate_args(args: argparse.Namespace, require_selection: bool = True) -> None:
+    """Validate paths and numeric evaluation settings."""
+    missing = [name for name in ("baseline_dir", "exp_dir", "data", "images", "labels") if getattr(args, name) is None]
     if missing:
-        raise SystemExit(f"Missing comparison parameters: {', '.join('--' + name for name in missing)}")
+        raise SystemExit(f"Missing comparison parameters: {', '.join('--' + name.replace('_', '-') for name in missing)}")
     if args.imgsz < 1 or args.batch < 1 or args.workers < 0 or args.max_det < 1:
         raise SystemExit("imgsz, batch, and max-det must be positive; workers must be non-negative")
-    for name in required:
+    for name in ("baseline_dir", "exp_dir", "data", "images", "labels"):
         path = Path(getattr(args, name))
         if not path.exists():
             raise FileNotFoundError(path)
+    if args.start_epoch is not None and args.end_epoch is not None and args.start_epoch > args.end_epoch:
+        raise SystemExit("start-epoch must not be greater than end-epoch")
+    if args.epochs is not None and any(epoch < 0 for epoch in args.epochs):
+        raise SystemExit("epochs must be non-negative")
+    if require_selection:
+        resolve_checkpoint_pairs(args)
+
+
+def _epoch_number(path: Path) -> int:
+    match = re.fullmatch(r"epoch(\d+)\.pt", path.name, re.IGNORECASE)
+    return int(match.group(1)) if match else 10**12
+
+
+def resolve_checkpoint_pairs(args: argparse.Namespace) -> list[tuple[str, Path, Path]]:
+    """Resolve matching checkpoint names and return (name, baseline_path, exp_path)."""
+    baseline_dir, exp_dir = Path(args.baseline_dir), Path(args.exp_dir)
+    if args.full:
+        baseline_names = {path.name for path in baseline_dir.glob("epoch*.pt") if path.is_file()}
+        exp_names = {path.name for path in exp_dir.glob("epoch*.pt") if path.is_file()}
+        names = [(name, baseline_dir / name, exp_dir / name) for name in sorted(baseline_names & exp_names, key=lambda value: (_epoch_number(Path(value)), value))]
+        for name in ("best.pt", "last.pt"):
+            if (baseline_dir / name).is_file() and (exp_dir / name).is_file():
+                names.append((name, baseline_dir / name, exp_dir / name))
+    else:
+        epochs = list(args.epochs or [])
+        if args.start_epoch is not None or args.end_epoch is not None:
+            if args.start_epoch is None or args.end_epoch is None:
+                raise SystemExit("--start-epoch and --end-epoch must be supplied together")
+            epochs.extend(range(args.start_epoch, args.end_epoch + 1))
+        if epochs:
+            names = []
+            for epoch in dict.fromkeys(epochs):
+                name = args.checkpoint_pattern.format(epoch=epoch)
+                names.append((name, baseline_dir / name, exp_dir / name))
+        elif args.checkpoint_name:
+            name = Path(args.checkpoint_name).name
+            names = [(name, baseline_dir / name, exp_dir / name)]
+        else:
+            raise SystemExit("Choose one checkpoint with --checkpoint-name, multiple with --epochs, a range, or --full")
+
+    if not names:
+        raise FileNotFoundError("No matching checkpoint pairs were found in the two weights directories")
+    missing = [(name, left, right) for name, left, right in names if not left.is_file() or not right.is_file()]
+    if missing:
+        details = "; ".join(f"{name}: baseline={'yes' if left.is_file() else 'no'}, exp={'yes' if right.is_file() else 'no'}" for name, left, right in missing)
+        raise FileNotFoundError(f"Checkpoint pair missing: {details}")
+    return names
 
 
 def yolo_ground_truth(images_dir: Path, labels_dir: Path) -> tuple[dict, dict[str, int]]:
@@ -102,7 +168,6 @@ def yolo_ground_truth(images_dir: Path, labels_dir: Path) -> tuple[dict, dict[st
     image_paths = sorted(path for path in images_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
     if not image_paths:
         raise FileNotFoundError(f"No validation images found in {images_dir}")
-
     images, annotations = [], []
     filename_to_id: dict[str, int] = {}
     annotation_id = 1
@@ -111,7 +176,6 @@ def yolo_ground_truth(images_dir: Path, labels_dir: Path) -> tuple[dict, dict[st
             width, height = image.size
         filename_to_id[image_path.name] = image_id
         images.append({"id": image_id, "file_name": image_path.name, "width": width, "height": height})
-
         label_path = labels_dir / f"{image_path.stem}.txt"
         if not label_path.is_file():
             continue
@@ -125,7 +189,6 @@ def yolo_ground_truth(images_dir: Path, labels_dir: Path) -> tuple[dict, dict[st
             class_index = int(class_id)
             if class_id != class_index or not 0 <= class_index < len(VISDRONE_NAMES):
                 raise ValueError(f"Invalid class ID {class_id} in {label_path}:{line_number}")
-
             x1 = max(0.0, (x_center - box_width / 2) * width)
             y1 = max(0.0, (y_center - box_height / 2) * height)
             x2 = min(float(width), (x_center + box_width / 2) * width)
@@ -133,25 +196,12 @@ def yolo_ground_truth(images_dir: Path, labels_dir: Path) -> tuple[dict, dict[st
             pixel_width, pixel_height = max(0.0, x2 - x1), max(0.0, y2 - y1)
             if pixel_width == 0 or pixel_height == 0:
                 continue
-            annotations.append(
-                {
-                    "id": annotation_id,
-                    "image_id": image_id,
-                    "category_id": class_index + 1,
-                    "bbox": [x1, y1, pixel_width, pixel_height],
-                    "area": pixel_width * pixel_height,
-                    "iscrowd": 0,
-                    "segmentation": [],
-                }
-            )
+            annotations.append({"id": annotation_id, "image_id": image_id, "category_id": class_index + 1,
+                                "bbox": [x1, y1, pixel_width, pixel_height], "area": pixel_width * pixel_height,
+                                "iscrowd": 0, "segmentation": []})
             annotation_id += 1
-
-    dataset = {
-        "info": {"description": "VisDrone validation labels converted from YOLO format"},
-        "images": images,
-        "annotations": annotations,
-        "categories": [{"id": i + 1, "name": name} for i, name in enumerate(VISDRONE_NAMES)],
-    }
+    dataset = {"info": {"description": "VisDrone validation labels converted from YOLO format"}, "images": images,
+               "annotations": annotations, "categories": [{"id": i + 1, "name": name} for i, name in enumerate(VISDRONE_NAMES)]}
     return dataset, filename_to_id
 
 
@@ -161,22 +211,15 @@ def remap_predictions(predictions_path: Path, filename_to_id: dict[str, int]) ->
     for prediction in predictions:
         filename = prediction.get("file_name") or f"{prediction['image_id']}.jpg"
         image_id = filename_to_id.get(Path(filename).name)
-        if image_id is None:
-            continue
-        remapped.append(
-            {
-                "image_id": image_id,
-                "category_id": int(prediction["category_id"]),
-                "bbox": [float(value) for value in prediction["bbox"]],
-                "score": float(prediction["score"]),
-            }
-        )
+        if image_id is not None:
+            remapped.append({"image_id": image_id, "category_id": int(prediction["category_id"]),
+                             "bbox": [float(value) for value in prediction["bbox"]], "score": float(prediction["score"])})
     if not remapped:
         raise ValueError(f"No predictions from {predictions_path} matched validation filenames")
     return remapped
 
 
-def coco_metrics(coco_gt: COCO, predictions: list[dict], max_det: int) -> dict[str, float]:
+def coco_metrics(coco_gt, predictions: list[dict], max_det: int) -> dict[str, float]:
     from faster_coco_eval import COCOeval_faster
 
     coco_dt = coco_gt.loadRes(predictions)
@@ -189,94 +232,73 @@ def coco_metrics(coco_gt: COCO, predictions: list[dict], max_det: int) -> dict[s
     return {key: float(value) for key, value in evaluator.stats_as_dict.items()}
 
 
-def validate_checkpoint(
-    name: str,
-    checkpoint: Path,
-    args: argparse.Namespace,
-    temporary_root: Path,
-    coco_gt: COCO,
-    filename_to_id: dict[str, int],
-) -> dict:
+def validate_checkpoint(name: str, checkpoint: Path, args: argparse.Namespace, temporary_root: Path, coco_gt, filename_to_id: dict[str, int]) -> dict:
     from ultralytics import YOLO
 
     print(f"Evaluating {name}: {checkpoint}", flush=True)
-    validation = YOLO(str(checkpoint)).val(
-        data=str(args.data),
-        split="val",
-        imgsz=args.imgsz,
-        batch=args.batch,
-        device=args.device,
-        workers=args.workers,
-        plots=False,
-        save_json=True,
-        project=str(temporary_root),
-        name=name,
-        exist_ok=True,
-        verbose=False,
-        max_det=args.max_det,
-    )
-    predictions_path = Path(validation.save_dir) / "predictions.json"
-    predictions = remap_predictions(predictions_path, filename_to_id)
-    return {
-        "checkpoint": str(checkpoint.resolve()),
-        "ultralytics": {key: float(value) for key, value in validation.results_dict.items()},
-        "coco_max_dets_100": coco_metrics(coco_gt, predictions, 100),
-        "dense_max_dets_300": coco_metrics(coco_gt, predictions, 300),
-    }
+    validation = YOLO(str(checkpoint)).val(data=str(args.data), split="val", imgsz=args.imgsz, batch=args.batch,
+        device=args.device, workers=args.workers, plots=False, save_json=True, project=str(temporary_root), name=name,
+        exist_ok=True, verbose=False, max_det=args.max_det)
+    predictions = remap_predictions(Path(validation.save_dir) / "predictions.json", filename_to_id)
+    return {"checkpoint": str(checkpoint.resolve()), "ultralytics": {key: float(value) for key, value in validation.results_dict.items()},
+            "coco_max_dets_100": coco_metrics(coco_gt, predictions, 100),
+            "dense_max_dets_300": coco_metrics(coco_gt, predictions, 300)}
+
+
+def calculate_delta(baseline: dict, exp: dict) -> dict[str, float]:
+    return {key: (exp["coco_max_dets_100"][key] - baseline["coco_max_dets_100"][key]) * 100
+            for key in ("AP_all", "AP_50", "AP_75", "AP_small", "AP_medium", "AP_large")}
 
 
 def main() -> None:
     args = parse_args()
-    validate_args(args)
+    has_selection = any((args.checkpoint_name, args.epochs, args.start_epoch, args.end_epoch, args.full))
+    validate_args(args, require_selection=args.mode != "set" or has_selection)
     if args.mode == "set":
         save_settings(args)
         print(f"Saved comparison settings to {SETTINGS_PATH.resolve()}")
-        saved = load_settings()
-        print(f"saved_parameter_count={len(saved)}")
-        print(json.dumps(saved, ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps(load_settings(), ensure_ascii=False, indent=2, sort_keys=True))
         return
     if args.print_config:
-        print(json.dumps({key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}, ensure_ascii=False, indent=2, sort_keys=True))
+        pairs = resolve_checkpoint_pairs(args)
+        config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+        config["checkpoint_pairs"] = [{"name": name, "baseline": str(left), "exp": str(right)} for name, left, right in pairs]
+        print(json.dumps(config, ensure_ascii=False, indent=2, sort_keys=True))
         return
 
     from faster_coco_eval import COCO
 
+    pairs = resolve_checkpoint_pairs(args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-
     dataset, filename_to_id = yolo_ground_truth(args.images.resolve(), args.labels.resolve())
     coco_gt = COCO(dataset, print_function=lambda *_: None)
+    comparisons = []
     with tempfile.TemporaryDirectory(prefix="a2or_aps_", dir=args.output.parent) as temporary_directory:
         temporary_root = Path(temporary_directory)
-        baseline = validate_checkpoint("baseline", args.baseline.resolve(), args, temporary_root, coco_gt, filename_to_id)
-        exp = validate_checkpoint("exp", args.exp.resolve(), args, temporary_root, coco_gt, filename_to_id)
+        for index, (checkpoint_name, baseline_path, exp_path) in enumerate(pairs, start=1):
+            safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", checkpoint_name)
+            baseline = validate_checkpoint(f"{index:03d}_{safe_name}_baseline", baseline_path.resolve(), args, temporary_root, coco_gt, filename_to_id)
+            exp = validate_checkpoint(f"{index:03d}_{safe_name}_exp", exp_path.resolve(), args, temporary_root, coco_gt, filename_to_id)
+            comparisons.append({"checkpoint_name": checkpoint_name, "baseline": baseline, "exp": exp,
+                                "exp_minus_baseline_points": calculate_delta(baseline, exp)})
 
-    primary_baseline = baseline["coco_max_dets_100"]
-    primary_exp = exp["coco_max_dets_100"]
-    delta = {
-        key: (primary_exp[key] - primary_baseline[key]) * 100
-        for key in ("AP_all", "AP_50", "AP_75", "AP_small", "AP_medium", "AP_large")
-    }
-    report = {
-        "protocol": {
-            "area_ranges_original_pixels": {"small": [0, 1024], "medium": [1024, 9216], "large": [9216, 1e10]},
-            "primary": "COCO maxDets=100",
-            "supplemental": "VisDrone-dense maxDets=300",
-            "validation_images": len(dataset["images"]),
-            "ground_truth_boxes": len(dataset["annotations"]),
-            "imgsz": args.imgsz,
-        },
-        "baseline": baseline,
-        "exp": exp,
-        "exp_minus_baseline_points": delta,
-    }
+    report = {"protocol": {"area_ranges_original_pixels": {"small": [0, 1024], "medium": [1024, 9216], "large": [9216, 1e10]},
+                           "primary": "COCO maxDets=100", "supplemental": "VisDrone-dense maxDets=300",
+                           "validation_images": len(dataset["images"]), "ground_truth_boxes": len(dataset["annotations"]),
+                           "imgsz": args.imgsz, "batch": args.batch, "device": args.device, "workers": args.workers,
+                           "max_det": args.max_det, "comparison_count": len(comparisons)}, "comparisons": comparisons}
+    if len(comparisons) == 1:
+        report.update({"baseline": comparisons[0]["baseline"], "exp": comparisons[0]["exp"],
+                       "exp_minus_baseline_points": comparisons[0]["exp_minus_baseline_points"]})
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("\nCOCO maxDets=100 (percentage points)")
-    print("metric       baseline       exp       delta")
-    for label, key in (("AP", "AP_all"), ("AP50", "AP_50"), ("APs", "AP_small"), ("APm", "AP_medium"), ("APl", "AP_large")):
-        baseline_value = primary_baseline[key] * 100
-        exp_value = primary_exp[key] * 100
-        print(f"{label:<8} {baseline_value:10.3f} {exp_value:10.3f} {exp_value - baseline_value:+10.3f}")
+    print("checkpoint       metric       baseline       exp       delta")
+    for comparison in comparisons:
+        base_metrics, exp_metrics = comparison["baseline"]["coco_max_dets_100"], comparison["exp"]["coco_max_dets_100"]
+        for label, key in (("AP", "AP_all"), ("AP50", "AP_50"), ("APs", "AP_small"), ("APm", "AP_medium"), ("APl", "AP_large")):
+            baseline_value, exp_value = base_metrics[key] * 100, exp_metrics[key] * 100
+            print(f"{comparison['checkpoint_name']:<16} {label:<10} {baseline_value:10.3f} {exp_value:10.3f} {exp_value - baseline_value:+10.3f}")
     print(f"\nSaved auditable results to {args.output.resolve()}")
 
 
