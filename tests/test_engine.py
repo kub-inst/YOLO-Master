@@ -218,7 +218,13 @@ def test_resume_allows_epoch_and_fraction_overrides(tmp_path):
             "model": DetectionModel("yolo26n.yaml", verbose=False),
             "ema": None,
             "epoch": 0,
-            "train_args": {**vars(DEFAULT_CFG), "data": "coco8.yaml", "epochs": 1, "fraction": 0.01},
+            "train_args": {
+                **vars(DEFAULT_CFG),
+                "data": "coco8.yaml",
+                "epochs": 1,
+                "fraction": 0.01,
+                "tal_candidate_expand_linear_decay": True,
+            },
         },
         checkpoint,
     )
@@ -229,6 +235,7 @@ def test_resume_allows_epoch_and_fraction_overrides(tmp_path):
             "data": "coco8.yaml",
             "epochs": 2,
             "fraction": 1.0,
+            "tal_candidate_expand_linear_decay": False,
             "device": "cpu",
             "workers": 0,
         }
@@ -236,6 +243,7 @@ def test_resume_allows_epoch_and_fraction_overrides(tmp_path):
 
     assert trainer.args.epochs == 2
     assert trainer.args.fraction == 1.0
+    assert trainer.args.tal_candidate_expand_linear_decay is True
 
 
 def test_distill_resume(tmp_path: Path):

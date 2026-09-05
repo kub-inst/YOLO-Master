@@ -77,6 +77,33 @@ from ultralytics.utils.torch_utils import (
     unwrap_model,
 )
 
+
+# Parameters that describe the runtime of a resumed job rather than the
+# experiment itself.  All other parameters must come from the checkpoint so
+# that custom research knobs (for example TAL/STAL options) cannot silently
+# change during resume.
+RESUME_RUNTIME_OVERRIDE_KEYS = frozenset(
+    {
+        "imgsz",
+        "batch",
+        "device",
+        "close_mosaic",
+        "augmentations",
+        "save_period",
+        "workers",
+        "cache",
+        "epochs",
+        "fraction",
+        "patience",
+        "time",
+        "freeze",
+        "val",
+        "plots",
+        "distill_model",
+        "save_dir",
+    }
+)
+
 __all__ = [
     "BaseTrainer",
     "MultiTrainer",
@@ -1421,34 +1448,32 @@ class BaseTrainer:
             try:
                 exists = isinstance(resume, (str, Path)) and Path(resume).exists()
                 last = Path(check_file(resume) if exists else get_latest_run())
-                ckpt_args = load_checkpoint(last)[0].args
+                # Use the checkpoint's serialized training arguments as the
+                # single source of truth.  Do not merge the caller's full
+                # config here: it commonly contains defaults for custom
+                # experiment parameters and can silently alter a resume.
+                ckpt_model, _ = load_checkpoint(last)
+                ckpt_args = (
+                    dict(vars(ckpt_model.args)) if hasattr(ckpt_model.args, "__dict__") else dict(ckpt_model.args)
+                )
                 if not isinstance(ckpt_args["data"], dict) and not Path(ckpt_args["data"]).exists():
                     ckpt_args["data"] = self.args.data
 
                 resume = True
                 self.args = get_cfg(ckpt_args)
                 self.args.model = self.args.resume = str(last)  # reinstate model
-                for k in (
-                    "imgsz",
-                    "batch",
-                    "device",
-                    "close_mosaic",
-                    "augmentations",
-                    "save_period",
-                    "workers",
-                    "cache",
-                    "epochs",
-                    "fraction",
-                    "patience",
-                    "time",
-                    "freeze",
-                    "val",
-                    "plots",
-                    "distill_model",
-                    "save_dir",
-                ):  # allow arg updates to reduce memory or update device on resume
+                for k in RESUME_RUNTIME_OVERRIDE_KEYS:
+                    # Only the explicitly supplied caller value may update a
+                    # runtime field.  Every non-runtime field, including
+                    # optimizer and TAL/STAL settings, remains checkpoint-owned.
                     if k in overrides:
                         setattr(self.args, k, overrides[k])
+
+                # Loss construction reads model.args. Keep it identical to the
+                # trainer args after resume so custom experiment parameters do
+                # not diverge between the two namespaces.
+                if hasattr(self, "model") and isinstance(self.model, nn.Module):
+                    self.model.args = self.args
 
                 # Handle augmentations parameter for resume: check if user provided custom augmentations
                 if ckpt_args.get("augmentations") is not None:
