@@ -7,12 +7,8 @@ import json
 import tempfile
 from pathlib import Path
 
-from faster_coco_eval import COCO, COCOeval_faster
-from PIL import Image
-from ultralytics import YOLO
-
-
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+SETTINGS_PATH = Path(__file__).resolve().parent / ".runtime_data" / "compare_aps_settings.json"
 VISDRONE_NAMES = (
     "pedestrian",
     "people",
@@ -29,20 +25,80 @@ VISDRONE_NAMES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--baseline", type=Path, required=True, help="Baseline checkpoint, e.g. weights/epoch29.pt.")
-    parser.add_argument("--exp", type=Path, required=True, help="exp checkpoint from the same training epoch.")
-    parser.add_argument("--data", type=Path, required=True, help="Ultralytics dataset YAML.")
-    parser.add_argument("--images", type=Path, required=True, help="Validation images directory.")
-    parser.add_argument("--labels", type=Path, required=True, help="Validation YOLO labels directory.")
-    parser.add_argument("--output", type=Path, default=Path("A2OR/aps_comparison.json"))
-    parser.add_argument("--imgsz", type=int, default=800)
-    parser.add_argument("--batch", type=int, default=16, help="Evaluation batch size; does not change the metric.")
-    parser.add_argument("--device", default="0")
-    parser.add_argument("--workers", type=int, default=8)
-    return parser.parse_args()
+    parser.add_argument("--mode", choices=("compare", "set"), default="compare")
+    parser.add_argument("--baseline", type=Path, default=None, help="Baseline checkpoint, e.g. weights/epoch29.pt.")
+    parser.add_argument("--exp", type=Path, default=None, help="Experiment checkpoint from the same training epoch.")
+    parser.add_argument("--data", type=Path, default=None, help="Ultralytics dataset YAML.")
+    parser.add_argument("--images", type=Path, default=None, help="Validation images directory.")
+    parser.add_argument("--labels", type=Path, default=None, help="Validation YOLO labels directory.")
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--imgsz", type=int, default=None)
+    parser.add_argument("--batch", type=int, default=None, help="Evaluation batch size; does not change the metric.")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--max-det", type=int, default=None, help="Maximum detections per image during validation.")
+    parser.add_argument("--print-config", action="store_true", help="Print effective parameters without evaluation.")
+    args = parser.parse_args()
+    saved = load_settings()
+    for field in ("baseline", "exp", "data", "images", "labels", "output", "imgsz", "batch", "device", "workers", "max_det"):
+        if getattr(args, field) is None and field in saved:
+            setattr(args, field, Path(saved[field]) if field in {"baseline", "exp", "data", "images", "labels", "output"} else saved[field])
+    if args.output is None:
+        args.output = Path("A2OR/aps_comparison.json")
+    if args.imgsz is None:
+        args.imgsz = 800
+    if args.batch is None:
+        args.batch = 16
+    if args.device is None:
+        args.device = "0"
+    if args.workers is None:
+        args.workers = 8
+    if args.max_det is None:
+        args.max_det = 300
+    return args
+
+
+def load_settings() -> dict:
+    """Load persisted comparison parameters, if available."""
+    if not SETTINGS_PATH.is_file():
+        return {}
+    try:
+        value = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    params = value.get("params", {}) if isinstance(value, dict) else {}
+    return params if isinstance(params, dict) else {}
+
+
+def save_settings(args: argparse.Namespace) -> None:
+    """Persist the complete comparison configuration."""
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    params = {
+        "baseline": str(args.baseline), "exp": str(args.exp), "data": str(args.data),
+        "images": str(args.images), "labels": str(args.labels), "output": str(args.output),
+        "imgsz": args.imgsz, "batch": args.batch, "device": args.device,
+        "workers": args.workers, "max_det": args.max_det,
+    }
+    SETTINGS_PATH.write_text(json.dumps({"params": params}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    """Validate required paths and numeric evaluation settings."""
+    required = ("baseline", "exp", "data", "images", "labels")
+    missing = [name for name in required if getattr(args, name) is None]
+    if missing:
+        raise SystemExit(f"Missing comparison parameters: {', '.join('--' + name for name in missing)}")
+    if args.imgsz < 1 or args.batch < 1 or args.workers < 0 or args.max_det < 1:
+        raise SystemExit("imgsz, batch, and max-det must be positive; workers must be non-negative")
+    for name in required:
+        path = Path(getattr(args, name))
+        if not path.exists():
+            raise FileNotFoundError(path)
 
 
 def yolo_ground_truth(images_dir: Path, labels_dir: Path) -> tuple[dict, dict[str, int]]:
+    from PIL import Image
+
     image_paths = sorted(path for path in images_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES)
     if not image_paths:
         raise FileNotFoundError(f"No validation images found in {images_dir}")
@@ -121,6 +177,8 @@ def remap_predictions(predictions_path: Path, filename_to_id: dict[str, int]) ->
 
 
 def coco_metrics(coco_gt: COCO, predictions: list[dict], max_det: int) -> dict[str, float]:
+    from faster_coco_eval import COCOeval_faster
+
     coco_dt = coco_gt.loadRes(predictions)
     evaluator = COCOeval_faster(coco_gt, coco_dt, iouType="bbox", print_function=lambda *_: None)
     evaluator.params.imgIds = sorted(coco_gt.getImgIds())
@@ -139,6 +197,8 @@ def validate_checkpoint(
     coco_gt: COCO,
     filename_to_id: dict[str, int],
 ) -> dict:
+    from ultralytics import YOLO
+
     print(f"Evaluating {name}: {checkpoint}", flush=True)
     validation = YOLO(str(checkpoint)).val(
         data=str(args.data),
@@ -153,7 +213,7 @@ def validate_checkpoint(
         name=name,
         exist_ok=True,
         verbose=False,
-        max_det=300,
+        max_det=args.max_det,
     )
     predictions_path = Path(validation.save_dir) / "predictions.json"
     predictions = remap_predictions(predictions_path, filename_to_id)
@@ -167,9 +227,20 @@ def validate_checkpoint(
 
 def main() -> None:
     args = parse_args()
-    for path in (args.baseline, args.exp, args.data, args.images, args.labels):
-        if not path.exists():
-            raise FileNotFoundError(path)
+    validate_args(args)
+    if args.mode == "set":
+        save_settings(args)
+        print(f"Saved comparison settings to {SETTINGS_PATH.resolve()}")
+        saved = load_settings()
+        print(f"saved_parameter_count={len(saved)}")
+        print(json.dumps(saved, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if args.print_config:
+        print(json.dumps({key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    from faster_coco_eval import COCO
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     dataset, filename_to_id = yolo_ground_truth(args.images.resolve(), args.labels.resolve())
