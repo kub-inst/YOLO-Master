@@ -45,6 +45,18 @@ PERSISTED_FIELDS = {
 }
 PERSISTED_FLAG_ALIASES = {"lambda_value": "--lambda"}
 
+RESUME_RUNTIME_FIELDS = {
+    "imgsz", "batch", "device", "close_mosaic", "save_period", "workers", "cache", "epochs", "fraction",
+    "patience", "time", "freeze", "val", "plots", "distill_model", "save_dir",
+}
+
+CLI_CONFIG_FLAGS = {
+    "imgsz": "--imgsz", "batch": "--batch", "device": "--device", "close_mosaic": "--close-mosaic",
+    "save_period": "--save-period", "workers": "--workers", "cache": "--cache", "epochs": "--epochs",
+    "fraction": "--fraction", "patience": "--patience", "time": "--time", "freeze": "--freeze",
+    "val": "--val", "plots": "--plots", "distill_model": "--distill-model", "save_dir": "--save-dir",
+}
+
 
 class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
     """Keep the examples readable while showing option defaults."""
@@ -190,6 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-config", action="store_true", help="Print the effective request and exit without training.")
     args = apply_saved_defaults(parser.parse_args())
     supplied = {item.split("=", 1)[0] for item in sys.argv[1:] if item.startswith("--")}
+    args._supplied_options = supplied
     if args.mode and args.mode != "set":
         if "--dynamic-topk" not in supplied and "--no-dynamic-topk" not in supplied:
             args.dynamic_topk = args.mode in {"dtk", "dtk-axis"}
@@ -355,6 +368,31 @@ def make_config(args: argparse.Namespace) -> tuple[dict, Path, Path, Path, Path 
     return config, model, data, run_dir, data_root, dataset
 
 
+def merge_resume_config(config: dict, args: argparse.Namespace, resume: Path) -> tuple[dict, dict]:
+    """Make checkpoint arguments authoritative and apply explicit runtime overrides only."""
+    sys.path.insert(0, str(ROOT))
+    from ultralytics.nn.tasks import load_checkpoint
+
+    checkpoint_model, _ = load_checkpoint(resume)
+    checkpoint_args = checkpoint_model.args
+    checkpoint_args = dict(vars(checkpoint_args)) if hasattr(checkpoint_args, "__dict__") else dict(checkpoint_args)
+
+    final_config = {key: value for key, value in checkpoint_args.items() if key in config}
+    final_config.update({"model": str(resume), "resume": str(resume)})
+    supplied = getattr(args, "_supplied_options", set())
+    for field in RESUME_RUNTIME_FIELDS:
+        flag = CLI_CONFIG_FLAGS.get(field)
+        if flag and (flag in supplied or "--no-" + flag[2:] in supplied) and field in config:
+            final_config[field] = config[field]
+
+    # The explicit entry point owns the run location, while the checkpoint
+    # owns the experiment configuration.
+    final_config["project"] = config["project"]
+    final_config["name"] = config["name"]
+    final_config["exist_ok"] = config["exist_ok"]
+    return final_config, checkpoint_args
+
+
 def main() -> None:
     """Validate, print, and optionally start one explicit training run."""
     args = parse_args()
@@ -382,13 +420,22 @@ def main() -> None:
     os.chdir(ROOT)
     os.environ.setdefault("YOLO_CONFIG_DIR", str(ROOT / "A2OR/.ultralytics_config"))
     os.environ.setdefault("TQDM_ASCII", "1")
-    print("=== Explicit YOLO-Master training configuration ===", flush=True)
-    print(f"model={model} (pretrained={args.pretrained}; resume={bool(args.resume)})", flush=True)
-    print(f"data_yaml={data}", flush=True)
+    checkpoint_args = None
+    if args.resume:
+        try:
+            config, checkpoint_args = merge_resume_config(config, args, _path(args.resume, must_exist=True))
+        except (FileNotFoundError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+            raise SystemExit(f"[resume configuration error] {exc}") from exc
+
+    print("=== Explicit YOLO-Master effective training configuration ===", flush=True)
+    print(f"model={config.get('model', model)} (pretrained={config.get('pretrained')}; resume={bool(args.resume)})", flush=True)
+    print(f"data_yaml={config.get('data', data)}", flush=True)
     if data_root:
         print(f"data_root={data_root} (dataset={data_root / dataset})", flush=True)
         print(f"dataset={dataset}", flush=True)
     print(f"run_dir={run_dir}", flush=True)
+    if checkpoint_args is not None:
+        print("config_source=checkpoint train_args + explicit runtime overrides", flush=True)
     print(json.dumps(config, ensure_ascii=False, indent=2), flush=True)
     if args.print_config:
         return
