@@ -121,6 +121,16 @@ def validate_args(args: argparse.Namespace, require_selection: bool = True) -> N
         resolve_checkpoint_pairs(args)
 
 
+def validate_set_args(args: argparse.Namespace) -> None:
+    """Validate only values that can be checked without a complete configuration."""
+    if args.imgsz < 1 or args.batch < 1 or args.workers < 0 or args.max_det < 1:
+        raise SystemExit("imgsz, batch, and max-det must be positive; workers must be non-negative")
+    if args.start_epoch is not None and args.end_epoch is not None and args.start_epoch > args.end_epoch:
+        raise SystemExit("start-epoch must not be greater than end-epoch")
+    if args.epochs is not None and any(epoch < 0 for epoch in args.epochs):
+        raise SystemExit("epochs must be non-negative")
+
+
 def _epoch_number(path: Path) -> int:
     match = re.fullmatch(r"epoch(\d+)\.pt", path.name, re.IGNORECASE)
     return int(match.group(1)) if match else 10**12
@@ -252,13 +262,13 @@ def calculate_delta(baseline: dict, exp: dict) -> dict[str, float]:
 
 def main() -> None:
     args = parse_args()
-    has_selection = any((args.checkpoint_name, args.epochs, args.start_epoch, args.end_epoch, args.full))
-    validate_args(args, require_selection=args.mode != "set" or has_selection)
     if args.mode == "set":
+        validate_set_args(args)
         save_settings(args)
         print(f"Saved comparison settings to {SETTINGS_PATH.resolve()}")
         print(json.dumps(load_settings(), ensure_ascii=False, indent=2, sort_keys=True))
         return
+    validate_args(args, require_selection=True)
     if args.print_config:
         pairs = resolve_checkpoint_pairs(args)
         config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
