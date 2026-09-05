@@ -43,6 +43,7 @@ PERSISTED_FIELDS = {
     "expand_0_8", "expand_8_16", "expand_linear_decay", "expand_full_epochs", "expand_decay_epochs",
     "assignment_stats", "pretrained", "dynamic_topk", "candidate_expand",
 }
+PERSISTED_FLAG_ALIASES = {"lambda_value": "--lambda"}
 
 
 class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -235,7 +236,7 @@ def apply_saved_defaults(args: argparse.Namespace) -> argparse.Namespace:
     saved = load_saved_settings()
     supplied = {item.split("=", 1)[0] for item in sys.argv[1:] if item.startswith("--")}
     for field in PERSISTED_FIELDS:
-        flag = "--" + field.replace("_", "-")
+        flag = PERSISTED_FLAG_ALIASES.get(field, "--" + field.replace("_", "-"))
         if field in saved and flag not in supplied and "--no-" + flag[2:] not in supplied:
             setattr(args, field, saved[field])
     return args
@@ -370,6 +371,9 @@ def main() -> None:
         print(f"resolved_yaml={runtime_data}", flush=True)
         save_full_settings(args, data_root, dataset)
         print(f"saved_settings={SETTINGS_PATH}", flush=True)
+        saved = load_saved_settings()
+        print(f"saved_parameter_count={len(saved)}", flush=True)
+        print(json.dumps(saved, ensure_ascii=False, indent=2, sort_keys=True), flush=True)
         return
     try:
         config, model, data, run_dir, data_root, dataset = make_config(args)
